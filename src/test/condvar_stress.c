@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 #define NUM_THREADS 10
 #define NUM_TRIALS 1000
@@ -57,7 +57,7 @@ static void* thread(void* idp) {
   pthread_exit((void*)(intptr_t)num_written);
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   pthread_t threads[NUM_THREADS];
   int i;
   int threads_num_written = 0;
@@ -71,7 +71,7 @@ int main(int argc, char* argv[]) {
     {
       pthread_mutex_lock(&lock);
 
-      assert(i == trial);
+      test_assert(i == trial);
       test_assert(last_written == trial);
       ++trial;
       if (i % 2) {

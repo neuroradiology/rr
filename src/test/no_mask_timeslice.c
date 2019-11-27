@@ -1,11 +1,11 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static int pseudospinlock;
 static pthread_barrier_t bar;
 
-static void* thread(void* unused) {
+static void* thread(__attribute__((unused)) void* unused) {
   pthread_barrier_wait(&bar);
 
   sched_yield();
@@ -14,7 +14,7 @@ static void* thread(void* unused) {
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   sigset_t old, mask;
   pthread_t t;
 
@@ -26,8 +26,9 @@ int main(int argc, char* argv[]) {
   pthread_sigmask(SIG_BLOCK, &mask, &old);
 
   pthread_barrier_wait(&bar);
-  while (!pseudospinlock)
+  while (!pseudospinlock) {
     ;
+  }
 
   pthread_sigmask(SIG_SETMASK, &old, NULL);
 

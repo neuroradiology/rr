@@ -1,148 +1,33 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include <assert.h>
-#include <dlfcn.h>
-#include <getopt.h>
-#include <inttypes.h>
-#include <linux/version.h>
-#include <sched.h>
-#include <stdio.h>
-#include <string.h>
-#include <sysexits.h>
-#include <sys/prctl.h>
-#include <sys/utsname.h>
-#include <sys/wait.h>
+#include "main.h"
 
-#include <limits>
+#include <limits.h>
+#include <linux/version.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/utsname.h>
+
 #include <sstream>
 
-#include "preload/syscall_buffer.h"
-
+#include "Command.h"
+#include "Flags.h"
+#include "RecordCommand.h"
+#include "ReplayCommand.h"
+#include "core.h"
 #include "log.h"
-#include "recorder.h"
-#include "replayer.h"
-#include "syscalls.h"
-#include "task.h"
-#include "TraceStream.h"
 #include "util.h"
 
 using namespace std;
 
-extern char** environ;
+namespace rr {
 
-static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
-                                 const TraceFrame& frame) {
-  if (frame.event().type != EV_SYSCALLBUF_FLUSH) {
-    return;
-  }
-  auto buf = trace.read_raw_data();
-  size_t bytes_remaining =
-      buf.data.size() - sizeof(sizeof(struct syscallbuf_hdr));
-  auto flush_hdr = reinterpret_cast<const syscallbuf_hdr*>(buf.data.data());
-  if (flush_hdr->num_rec_bytes != bytes_remaining) {
-    fprintf(stderr, "Malformed trace file (bad recorded-bytes count)\n");
-    abort();
-  }
+// Show version and quit.
+static bool show_version = false;
+static bool show_cmd_list = false;
 
-  auto record_ptr = reinterpret_cast<const uint8_t*>(flush_hdr + 1);
-  auto end_ptr = record_ptr + bytes_remaining;
-  while (record_ptr < end_ptr) {
-    auto record = reinterpret_cast<const struct syscallbuf_record*>(record_ptr);
-    fprintf(out, "  { syscall:'%s', ret:0x%lx }\n",
-            syscall_name(record->syscallno, frame.event().arch()), record->ret);
-    if (record->size < sizeof(*record)) {
-      fprintf(stderr, "Malformed trace file (bad record size)\n");
-      abort();
-    }
-    record_ptr += stored_record_size(record->size);
-  }
-}
-
-/**
- * Dump all events from the current to trace that match |spec| to
- * |out|.  |spec| has the following syntax: /\d+(-\d+)?/, expressing
- * either a single event number of a range, and may be null to
- * indicate "dump all events".
- *
- * This function is side-effect-y, in that the trace file isn't
- * rewound in between matching each spec.  Therefore specs should be
- * constructed so as to match properly on a serial linear scan; that
- * is, they should comprise disjoint and monotonically increasing
- * event sets.  No attempt is made to enforce this or normalize specs.
- */
-static void dump_events_matching(TraceReader& trace, FILE* out,
-                                 const char* spec) {
-
-  uint32_t start = 0, end = numeric_limits<uint32_t>::max();
-
-  // Try to parse the "range" syntax '[start]-[end]'.
-  if (spec && 2 > sscanf(spec, "%u-%u", &start, &end)) {
-    // Fall back on assuming the spec is a single event
-    // number, however it parses out with atoi().
-    start = end = atoi(spec);
-  }
-
-  bool dump_raw_data = Flags::get().dump_syscallbuf;
-  while (!trace.at_end()) {
-    auto frame = trace.read_frame();
-    if (end < frame.time()) {
-      return;
-    }
-    if (start <= frame.time() && frame.time() <= end) {
-      if (Flags::get().raw_dump) {
-        frame.dump_raw(out);
-      } else {
-        frame.dump(out);
-      }
-      if (Flags::get().dump_syscallbuf) {
-        dump_syscallbuf_data(trace, out, frame);
-      }
-      if (!Flags::get().raw_dump) {
-        fprintf(out, "}\n");
-      }
-    }
-    TraceReader::RawData data;
-    while (dump_raw_data && trace.read_raw_data_for_frame(frame, data)) {
-      // Skip raw data for this frame
-    }
-  }
-}
-
-static void dump_statistics(const TraceReader& trace, FILE* out) {
-  uint64_t uncompressed = trace.uncompressed_bytes();
-  uint64_t compressed = trace.compressed_bytes();
-  fprintf(stdout, "// Uncompressed bytes %" PRIu64 ", compressed bytes %" PRIu64
-                  ", ratio %.2fx\n",
-          uncompressed, compressed, double(uncompressed) / compressed);
-}
-
-static int dump(int argc, char* argv[], char** envp) {
-  FILE* out = stdout;
-  TraceReader trace(argc > 0 ? argv[0] : "");
-
-  if (Flags::get().raw_dump) {
-    fprintf(out, "global_time tid reason "
-                 "hw_interrupts page_faults adapted_ticks instructions "
-                 "eax ebx ecx edx esi edi ebp orig_eax esp eip eflags\n");
-  }
-
-  if (1 == argc) {
-    // No specs => dump all events.
-    dump_events_matching(trace, stdout, nullptr /*all events*/);
-  } else {
-    for (int i = 1; i < argc; ++i) {
-      dump_events_matching(trace, stdout, argv[i]);
-    }
-  }
-
-  if (Flags::get().dump_statistics) {
-    dump_statistics(trace, stdout);
-  }
-
-  return 0;
-}
-
-static void assert_prerequisites(Flags* flags) {
+void assert_prerequisites(bool use_syscall_buffer) {
   struct utsname uname_buf;
   memset(&uname_buf, 0, sizeof(uname_buf));
   if (!uname(&uname_buf)) {
@@ -155,7 +40,7 @@ static void assert_prerequisites(Flags* flags) {
               << "functionality; need 3.4.0 or better.";
     }
 
-    if (flags->use_syscall_buffer &&
+    if (use_syscall_buffer &&
         KERNEL_VERSION(major, minor, 0) < KERNEL_VERSION(3, 5, 0)) {
       FATAL() << "Your kernel does not support syscall "
               << "filtering; please use the -n option";
@@ -163,65 +48,28 @@ static void assert_prerequisites(Flags* flags) {
   }
 }
 
-static void check_performance_settings() {
-  // NB: we hard-code "cpu0" here because rr pins itself and all
-  // tracees to cpu 0.  We don't care about the other CPUs.
-  ScopedFd fd("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-              O_RDONLY);
-  if (0 > fd) {
-    // If the file doesn't exist, the system probably
-    // doesn't have the ability to frequency-scale, for
-    // example a VM.
-    LOG(info) << "Unable to check CPU-frequency governor.";
-    return;
-  }
-  char governor[PATH_MAX];
-  ssize_t nread = read(fd, governor, sizeof(governor) - 1);
-  if (0 > nread) {
-    FATAL() << "Unable to read cpu0's frequency governor.";
-  }
-  governor[nread] = '\0';
-  ssize_t len = strlen(governor);
-  if (len > 0) {
-    // Eat the '\n'.
-    governor[len - 1] = '\0';
-  }
-  LOG(info) << "cpu0's frequency governor is '" << governor << "'";
-  if (strcmp("performance", governor)) {
-    fprintf(stderr,
-            "\n"
-            "rr: Warning: Your CPU frequency governor is '%s'.  rr strongly\n"
-            "    recommends that you use the 'performance' governor.  Not "
-            "using the\n"
-            "    'performance' governor can cause rr to be at least 2x slower\n"
-            "    on laptops.\n"
-            "\n"
-            "    On Fedora-based systems, you can enable the 'performance' "
-            "governor\n"
-            "    by running the following commands:\n"
-            "\n"
-            "    $ sudo yum install kernel-tools\n"
-            "    $ sudo cpupower frequency-set -g performance\n"
-            "\n",
-            governor);
-    // TODO: It would be nice to bail here or do something
-    // clever to enable the 'performance' just for rr, but
-    // that seems too hard at the moment.
-  }
-}
+void print_version(FILE* out) { fprintf(out, "rr version %s\n", RR_VERSION); }
 
-static void print_usage(void) {
+void print_global_options(FILE* out) {
   fputs(
-      "Usage: rr [OPTION] (record|replay|dump) [OPTION]... [ARG]...\n"
-      "\n"
-      "Common options\n"
-      "  -a, --microarch=<NAME>     force rr to assume it's running on a CPU\n"
+      "Global options:\n"
+      "  --disable-cpuid-faulting   disable use of CPUID faulting\n"
+      "  --disable-ptrace-exit_events disable use of PTRACE_EVENT_EXIT\n"
+      "  --resource-path=PATH       specify the paths that rr should use to "
+      "find\n"
+      "                             files such as rr_page_*.  These files "
+      "should\n"
+      "                             be located in PATH/bin, PATH/lib[64], and\n"
+      "                             PATH/share as appropriate.\n"
+      "  -A, --microarch=<NAME>     force rr to assume it's running on a CPU\n"
       "                             with microarch NAME even if runtime "
       "detection\n"
       "                             says otherwise.  NAME should be a string "
       "like\n"
-      "                             'Ivy Bridge'.\n"
-      "  -c, --checksum={on-syscalls,on-all-events}|FROM_TIME\n"
+      "                             'Ivy Bridge'. Note that rr will not work "
+      "with\n"
+      "                             Intel Merom or Penryn microarchitectures.\n"
+      "  -C, --checksum={on-syscalls,on-all-events}|FROM_TIME\n"
       "                             compute and store (during recording) or\n"
       "                             read and verify (during replay) checksums\n"
       "                             of each of a tracee's memory mappings "
@@ -231,400 +79,191 @@ static void print_usage(void) {
       "                             at all events (`on-all-events'), or \n"
       "                             starting from a global timepoint "
       "FROM_TIME\n"
-      "  -d, --dump-on=<SYSCALL_NUM|-SIGNAL_NUM>\n"
+      "  -D, --dump-on=<SYSCALL_NUM|-SIGNAL_NUM>\n"
       "                             dump memory at SYSCALL or SIGNAL to the\n"
       "                             file "
       "`[trace_dir]/[tid].[time]_{rec,rep}':\n"
       "                             `_rec' for dumps during recording, `_rep'\n"
       "                             for dumps during replay\n"
-      "  -f, --force-things\n       force rr to do some things that don't "
+      "  -F, --force-things         force rr to do some things that don't "
       "seem\n"
       "                             like good ideas, for example launching an\n"
       "                             interactive emergency debugger if stderr\n"
       "                             isn't a tty.\n"
-      "  -k, --check-cached-mmaps   verify that cached task mmaps match "
+      "  -K, --check-cached-mmaps   verify that cached task mmaps match "
       "/proc/maps\n"
-      "  -e, --fatal-errors         any warning or error that is printed is\n"
+      "  -E, --fatal-errors         any warning or error that is printed is\n"
       "                             treated as fatal\n"
-      "  -m, --mark-stdio           mark stdio writes with [rr.<EVENT-NO>],\n"
-      "                             where EVENT-NO is the global trace time "
-      "at\n"
-      "                             which the write occures.\n"
-      "  -s, --suppress-environment-warnings\n"
+      "  -M, --mark-stdio           mark stdio writes with [rr <PID> <EV>]\n"
+      "                             where EV is the global trace time at\n"
+      "                             which the write occurs and PID is the pid\n"
+      "                             of the process it occurs in.\n"
+      "  -N, --version              print the version number and exit\n"
+      "  -S, --suppress-environment-warnings\n"
       "                             suppress warnings about issues in the\n"
       "                             environment that rr has no control over\n"
-      "  -t, --dump-at=TIME         dump memory at global timepoint TIME\n"
-      "  -u, --cpu-unbound          allow tracees to run on any virtual CPU.\n"
-      "                             Default is to bind to CPU 0.  This option\n"
-      "                             can cause replay divergence: use with\n"
-      "                             caution.\n"
-      "  -v, --verbose              log messages that may not be urgently \n"
-      "                             critical to the user\n"
-      "  -w, --wait-secs=<NUM_SECS> wait NUM_SECS seconds just after startup,\n"
-      "                             before initiating recording or replaying\n"
+      "  -T, --dump-at=TIME         dump memory at global timepoint TIME\n"
       "\n"
-      "Syntax for `record'\n"
-      " rr record [OPTION]... <exe> [exe-args]...\n"
-      "  -b, --force-syscall-buffer force the syscall buffer preload library\n"
-      "                             to be used, even if that's probably a bad\n"
-      "                             idea\n"
-      "  -c, --num-cpu-ticks=<NUM>  maximum number of 'CPU ticks' (currently \n"
-      "                             retired conditional branches) to allow a \n"
-      "                             task to run before interrupting it\n"
-      "  -e, --num-events=<NUM>     maximum number of events (syscall \n"
-      "                             enter/exit, signal, CPU interrupt, ...) \n"
-      "                             to allow a task before descheduling it\n"
-      "  -i, --ignore-signal=<SIG>  block <SIG> from being delivered to "
-      "tracees.\n"
-      "                             Probably only useful for unit tests.\n"
-      "  -n, --no-syscall-buffer    disable the syscall buffer preload "
-      "library\n"
-      "                             even if it would otherwise be used\n"
-      "\n"
-      "Syntax for `replay'\n"
-      " rr replay [OPTION]... [<trace-dir>]\n"
-      "  -a, --autopilot            replay without debugger server\n"
-      "  -f, --onfork=<PID>         start a debug server when <PID> has been\n"
-      "                             fork()d, AND the target event has been\n"
-      "                             reached.\n"
-      "  -g, --goto=<EVENT-NUM>     start a debug server on reaching "
-      "<EVENT-NUM>\n"
-      "                             in the trace.  See -m above.\n"
-      "  -p, --onprocess=<PID>      start a debug server when <PID> has been\n"
-      "                             exec()d, AND the target event has been\n"
-      "                             reached.\n"
-      "  -q, --no-redirect-output   don't replay writes to stdout/stderr\n"
-      "  -s, --dbgport=<PORT>       only start a debug server on <PORT>;\n"
-      "                             don't automatically launch the debugger\n"
-      "                             client too.\n"
-      "  -x, --gdb-x=<FILE>         execute gdb commands from <FILE>\n"
-      "\n"
-      "Syntax for `dump`\n"
-      " rr dump [OPTIONS] <trace_dir> [<event-spec>...]\n"
-      "  Event specs can be either an event number like `127', or a range\n"
-      "  like `1000-5000'.  By default, all events are dumped.\n"
-      "  -r, --raw                  dump trace frames in a more easily\n"
-      "                             machine-parseable format instead of the\n"
-      "                             default human-readable format\n"
-      "  -s, --statistics           dump statistics about the trace\n"
-      "  -b, --syscallbuf           dump syscallbuf contents\n"
-      "\n"
-      "A command line like `rr (-h|--help|help)...' will print this message.\n",
-      stderr);
+      "Use RR_LOG to control logging; e.g. RR_LOG=all:warn,Task:debug\n",
+      out);
 }
 
-static int parse_record_args(int cmdi, int argc, char** argv, Flags* flags) {
-  struct option opts[] = {
-    { "force-syscall-buffer", no_argument, nullptr, 'b' },
-    { "ignore-signal", required_argument, nullptr, 'i' },
-    { "num-cpu-ticks", required_argument, nullptr, 'c' },
-    { "num-events", required_argument, nullptr, 'e' },
-    { "no-syscall-buffer", no_argument, nullptr, 'n' },
-    { 0 }
-  };
-  optind = cmdi;
-  while (1) {
-    int i = 0;
-    switch (getopt_long(argc, argv, "+c:be:i:n", opts, &i)) {
-      case -1:
-        return optind;
-      case 'b':
-        flags->use_syscall_buffer = true;
-        break;
-      case 'c':
-        flags->max_ticks = max(1, atoi(optarg));
-        break;
-      case 'e':
-        flags->max_events = max(1, atoi(optarg));
-        break;
-      case 'i':
-        flags->ignore_sig = min(_NSIG - 1, max(1, atoi(optarg)));
-        break;
-      case 'n':
-        flags->use_syscall_buffer = false;
-        break;
-      default:
-        return -1;
-    }
-  }
+void list_commands(FILE* out) {
+  Command::print_help_all(out);
 }
 
-static int parse_replay_args(int cmdi, int argc, char** argv, Flags* flags) {
-  struct option opts[] = { { "autopilot", no_argument, nullptr, 'a' },
-                           { "dbgport", required_argument, nullptr, 's' },
-                           { "goto", required_argument, nullptr, 'g' },
-                           { "no-redirect-output", no_argument, nullptr, 'q' },
-                           { "onfork", required_argument, nullptr, 'f' },
-                           { "onprocess", required_argument, nullptr, 'p' },
-                           { "gdb-x", required_argument, nullptr, 'x' },
-                           { 0 } };
-  optind = cmdi;
-  while (1) {
-    int i = 0;
-    switch (getopt_long(argc, argv, "+af:g:p:qs:x:", opts, &i)) {
-      case -1:
-        return optind;
-      case 'a':
-        flags->goto_event = numeric_limits<decltype(flags->goto_event)>::max();
-        flags->dont_launch_debugger = true;
-        break;
-      case 'f':
-        flags->target_process = atoi(optarg);
-        flags->process_created_how = Flags::CREATED_FORK;
-        break;
-      case 'g':
-        flags->goto_event = atoi(optarg);
-        break;
-      case 'p':
-        flags->target_process = atoi(optarg);
-        flags->process_created_how = Flags::CREATED_EXEC;
-        break;
-      case 'q':
-        flags->redirect = false;
-        break;
-      case 's':
-        flags->dbgport = atoi(optarg);
-        flags->dont_launch_debugger = true;
-        break;
-      case 'x':
-        flags->gdb_command_file_path = optarg;
-        break;
-      default:
-        return -1;
-    }
-  }
-}
-
-static int parse_dump_args(int cmdi, int argc, char** argv, Flags* flags) {
-  struct option opts[] = { { "syscallbuf", no_argument, nullptr, 'b' },
-                           { "raw", no_argument, nullptr, 'r' },
-                           { "statistics", no_argument, nullptr, 's' },
-                           { 0 } };
-  optind = cmdi;
-  while (1) {
-    int i = 0;
-    switch (getopt_long(argc, argv, "brs", opts, &i)) {
-      case -1:
-        return optind;
-      case 'b':
-        flags->dump_syscallbuf = true;
-        break;
-      case 'r':
-        flags->raw_dump = true;
-        break;
-      case 's':
-        flags->dump_statistics = true;
-        break;
-      default:
-        return -1;
-    }
-  }
-}
-
-static int parse_common_args(int argc, char** argv, Flags* flags) {
-  struct option opts[] = {
-    { "checksum", required_argument, nullptr, 'c' },
-    { "check-cached-mmaps", no_argument, nullptr, 'k' },
-    { "cpu-unbound", no_argument, nullptr, 'u' },
-    { "dump-at", required_argument, nullptr, 't' },
-    { "dump-on", required_argument, nullptr, 'd' },
-    { "force-things", no_argument, nullptr, 'f' },
-    { "force-microarch", required_argument, nullptr, 'a' },
-    { "mark-stdio", no_argument, nullptr, 'm' },
-    { "suppress-environment-warnings", no_argument, nullptr, 's' },
-    { "fatal-errors", no_argument, nullptr, 'e' },
-    { "verbose", no_argument, nullptr, 'v' },
-    { "wait-secs", required_argument, nullptr, 'w' },
-    { 0 }
-  };
-  while (1) {
-    int i = 0;
-    switch (getopt_long(argc, argv, "+a:c:d:efkmst:uvw:", opts, &i)) {
-      case -1:
-        return optind;
-      case 'a':
-        flags->forced_uarch = optarg;
-        break;
-      case 'c':
-        if (!strcmp("on-syscalls", optarg)) {
-          LOG(info) << "checksumming on syscall exit";
-          flags->checksum = Flags::CHECKSUM_SYSCALL;
-        } else if (!strcmp("on-all-events", optarg)) {
-          LOG(info) << "checksumming on all events";
-          flags->checksum = Flags::CHECKSUM_ALL;
-        } else {
-          flags->checksum = atoi(optarg);
-          LOG(info) << "checksumming on at event " << flags->checksum;
-        }
-        break;
-      case 'd':
-        flags->dump_on = atoi(optarg);
-        break;
-      case 'e':
-        flags->fatal_errors_and_warnings = true;
-        break;
-      case 'f':
-        flags->force_things = true;
-        break;
-      case 'k':
-        flags->check_cached_mmaps = true;
-        break;
-      case 'm':
-        flags->mark_stdio = true;
-        break;
-      case 's':
-        flags->suppress_environment_warnings = true;
-        break;
-      case 't':
-        flags->dump_at = atoi(optarg);
-        break;
-      case 'u':
-        flags->cpu_unbound = true;
-        break;
-      case 'v':
-        flags->verbose = true;
-        break;
-      case 'w':
-        flags->wait_secs = atoi(optarg);
-        break;
-      default:
-        return -1;
-    }
-  }
-}
-
-enum Command {
-  RECORD,
-  REPLAY,
-  DUMP_EVENTS
-};
-
-static int parse_args(int argc, char** argv, Flags* flags, Command* command) {
-  const char* exe = argv[0];
-  const char* cmd;
-  int cmdi;
-
-  flags->max_ticks = Flags::DEFAULT_MAX_TICKS;
-  flags->max_events = Flags::DEFAULT_MAX_EVENTS;
-  flags->checksum = Flags::CHECKSUM_NONE;
-  flags->dbgport = -1;
-  flags->dump_at = Flags::DUMP_AT_NONE;
-  flags->dump_on = Flags::DUMP_ON_NONE;
-  flags->redirect = true;
-  flags->use_syscall_buffer = true;
-  flags->suppress_environment_warnings = false;
-
-  if (0 > (cmdi = parse_common_args(argc, argv, flags))) {
-    return -1;
-  }
-  if (0 == cmdi || cmdi >= argc) {
-    fprintf(stderr, "%s: must specify a command\n", exe);
-    return -1;
-  }
-
-  cmd = argv[cmdi];
-  if (!strcmp("record", cmd)) {
-    *command = RECORD;
-    return parse_record_args(cmdi + 1, argc, argv, flags);
-  }
-  if (!strcmp("replay", cmd)) {
-    *command = REPLAY;
-    return parse_replay_args(cmdi + 1, argc, argv, flags);
-  }
-  if (!strcmp("dump", cmd)) {
-    *command = DUMP_EVENTS;
-    return parse_dump_args(cmdi + 1, argc, argv, flags);
-  }
-  if (!strcmp("help", cmd) || !strcmp("-h", cmd) || !strcmp("--help", cmd)) {
-    return -1;
-  }
-  *command = RECORD;
-  return parse_record_args(cmdi, argc, argv, flags);
-}
-
-static string find_syscall_buffer_library() {
-  char* exe_path = realpath("/proc/self/exe", nullptr);
-  string lib_path = exe_path;
-  free(exe_path);
-
-  int end = lib_path.length();
-  // Chop off the filename
-  while (end > 0 && lib_path[end - 1] != '/') {
-    --end;
-  }
-  lib_path.erase(end);
-  lib_path += "../lib/" SYSCALLBUF_LIB_FILENAME;
-  if (access(lib_path.c_str(), F_OK) != 0) {
-    // File does not exist. Assume install put it in LD_LIBRARY_PATH.
-    lib_path = SYSCALLBUF_LIB_FILENAME;
-  }
-  return lib_path;
+void print_usage(FILE* out) {
+  print_version(out);
+  fputs("\nUsage:\n", out);
+  list_commands(out);
+  fputs("\nIf no subcommand is provided, we check if the first non-option\n"
+        "argument is a directory. If it is, we assume the 'replay' subcommand\n"
+        "otherwise we assume the 'record' subcommand.\n\n",
+        out);
+  print_global_options(out);
 }
 
 static void init_random() {
   // Not very good, but good enough for our non-security-sensitive needs.
-  srandom(time(nullptr) ^ getpid());
+  int key;
+  good_random(&key, sizeof(key));
+  srandom(key);
+  srand(key);
 }
 
+bool parse_global_option(std::vector<std::string>& args) {
+  static const OptionSpec options[] = {
+    { 0, "disable-cpuid-faulting", NO_PARAMETER },
+    { 1, "disable-ptrace-exit-events", NO_PARAMETER },
+    { 2, "resource-path", HAS_PARAMETER },
+    { 'A', "microarch", HAS_PARAMETER },
+    { 'C', "checksum", HAS_PARAMETER },
+    { 'D', "dump-on", HAS_PARAMETER },
+    { 'E', "fatal-errors", NO_PARAMETER },
+    { 'F', "force-things", NO_PARAMETER },
+    { 'K', "check-cached-mmaps", NO_PARAMETER },
+    { 'L', "list-commands", NO_PARAMETER },
+    { 'M', "mark-stdio", NO_PARAMETER },
+    { 'N', "version", NO_PARAMETER },
+    { 'S', "suppress-environment-warnings", NO_PARAMETER },
+    { 'T', "dump-at", HAS_PARAMETER },
+  };
+
+  ParsedOption opt;
+  if (!Command::parse_option(args, options, &opt)) {
+    return false;
+  }
+
+  Flags& flags = Flags::get_for_init();
+  switch (opt.short_name) {
+    case 0:
+      flags.disable_cpuid_faulting = true;
+      break;
+    case 1:
+      flags.disable_ptrace_exit_events = true;
+      break;
+    case 2:
+      flags.resource_path = opt.value;
+      if (flags.resource_path.back() != '/') {
+        flags.resource_path.append("/");
+      }
+      break;
+    case 'A':
+      flags.forced_uarch = opt.value;
+      break;
+    case 'C':
+      if (opt.value == "on-syscalls") {
+        LOG(info) << "checksumming on syscall exit";
+        flags.checksum = Flags::CHECKSUM_SYSCALL;
+      } else if (opt.value == "on-all-events") {
+        LOG(info) << "checksumming on all events";
+        flags.checksum = Flags::CHECKSUM_ALL;
+      } else {
+        flags.checksum = strtoll(opt.value.c_str(), NULL, 10);
+        LOG(info) << "checksumming on at event " << flags.checksum;
+      }
+      break;
+    case 'D':
+      if (opt.value == "RDTSC") {
+        flags.dump_on = Flags::DUMP_ON_RDTSC;
+      } else {
+        flags.dump_on = strtoll(opt.value.c_str(), NULL, 10);
+      }
+      break;
+    case 'E':
+      flags.fatal_errors_and_warnings = true;
+      break;
+    case 'F':
+      flags.force_things = true;
+      break;
+    case 'K':
+      flags.check_cached_mmaps = true;
+      break;
+    case 'M':
+      flags.mark_stdio = true;
+      break;
+    case 'S':
+      flags.suppress_environment_warnings = true;
+      break;
+    case 'T':
+      flags.dump_at = strtoll(opt.value.c_str(), NULL, 10);
+      break;
+    case 'N':
+      show_version = true;
+      break;
+    case 'L':
+      show_cmd_list = true;
+      break;
+    default:
+      DEBUG_ASSERT(0 && "Invalid flag");
+  }
+  return true;
+}
+
+} // namespace rr
+
+using namespace rr;
+
 int main(int argc, char* argv[]) {
-  int argi; /* index of first positional argument */
-  Flags* flags = &Flags::get_for_init();
-
   init_random();
+  raise_resource_limits();
 
-  Command command;
-  if (0 > (argi = parse_args(argc, argv, flags, &command)) || argc < argi ||
-      // |rr replay| is allowed to have no arguments to replay
-      // the most recently saved trace.
-      (REPLAY != command && argc <= argi)) {
-    print_usage();
+  vector<string> args;
+  for (int i = 1; i < argc; ++i) {
+    args.push_back(argv[i]);
+  }
+
+  while (parse_global_option(args)) {
+  }
+
+  if (show_version) {
+    print_version(stdout);
+    return 0;
+  }
+  if (show_cmd_list) {
+    list_commands(stdout);
+    return 0;
+  }
+
+  if (args.size() == 0) {
+    print_usage(stderr);
     return 1;
   }
 
-  assert_prerequisites(flags);
-  if (!flags->suppress_environment_warnings) {
-    check_performance_settings();
-  }
-
-  int wait_secs = flags->wait_secs;
-  if (wait_secs > 0) {
-    struct timespec ts;
-    ts.tv_sec = wait_secs;
-    ts.tv_nsec = 0;
-    LOG(info) << "Waiting " << wait_secs << " seconds before continuing ...";
-    nanosleep_nointr(&ts);
-    LOG(info) << "... continuing.";
-  }
-
-  if (RECORD == command) {
-    LOG(info) << "Scheduler using max_events=" << flags->max_events
-              << ", max_ticks=" << flags->max_ticks;
-
-    // The syscallbuf library interposes some critical
-    // external symbols like XShmQueryExtension(), so we
-    // preload it whether or not syscallbuf is enabled.
-    if (flags->use_syscall_buffer) {
-      setenv(SYSCALLBUF_ENABLED_ENV_VAR, "1", 1);
-    } else {
-      LOG(info) << "Syscall buffer disabled by flag";
-      unsetenv(SYSCALLBUF_ENABLED_ENV_VAR);
+  auto command = Command::command_for_name(args[0]);
+  if (command) {
+    args.erase(args.begin());
+  } else {
+    if (!Command::verify_not_option(args)) {
+      print_usage(stderr);
+      return 1;
     }
-    flags->syscall_buffer_lib_path = find_syscall_buffer_library();
+    if (is_directory(args[0].c_str())) {
+      command = ReplayCommand::get();
+    } else {
+      command = RecordCommand::get();
+    }
   }
 
-  const char* rr_exe = argv[0];
-  argc -= argi;
-  argv += argi;
-
-  switch (command) {
-    case RECORD:
-      return record(rr_exe, argc, argv, environ);
-    case REPLAY:
-      return replay(argc, argv, environ);
-    case DUMP_EVENTS:
-      return dump(argc, argv, environ);
-    default:
-      FATAL() << "Unknown option " << command;
-      return 0; // unreached
-  }
+  return command->run(args);
 }

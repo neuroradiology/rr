@@ -2,13 +2,10 @@
 
 #include "Flags.h"
 
-#include <assert.h>
+namespace rr {
 
-Flags& Flags::get_for_init() {
-  static bool initialized = false;
-  assert(!initialized);
-  initialized = true;
-  return singleton;
-}
+Flags& Flags::get_for_init() { return singleton; }
 
 Flags Flags::singleton;
+
+} // namespace rr

@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static sig_atomic_t caught_usr1;
 
@@ -15,17 +15,18 @@ static void breakpoint(void) {
   (void)break_here;
 }
 
-int main(int argc, char* argv[]) {
-  int dummy, i;
+int main(void) {
+  int dummy = 0, i;
 
   signal(SIGUSR1, handle_usr1);
+
+  atomic_puts("ready");
 
   breakpoint();
   /* NO SYSCALLS AFTER HERE!  (Up to the assert.) */
   for (i = 1; !caught_usr1 && i < (1 << 30); ++i) {
     dummy += (dummy + i) % 9735;
   }
-  test_assert(caught_usr1);
 
   atomic_puts("EXIT-SUCCESS");
   return 0;

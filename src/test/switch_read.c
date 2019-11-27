@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static const char start_token = '!';
 static const char sentinel_token = ' ';
@@ -10,7 +10,7 @@ static pthread_barrier_t barrier;
 
 static int sockfds[2];
 
-static void* reader_thread(void* dontcare) {
+static void* reader_thread(__attribute__((unused)) void* dontcare) {
   int readsock = sockfds[1];
   char c = sentinel_token;
   struct timeval tv;
@@ -29,7 +29,7 @@ static void* reader_thread(void* dontcare) {
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   char token = start_token;
   struct timeval ts;
 

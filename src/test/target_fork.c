@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void bad_breakpoint(void) {
   int break_here = 1;
@@ -12,7 +12,7 @@ static void good_breakpoint(void) {
   (void)break_here;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char* argv[]) {
   int num_syscalls;
   int child;
   int i;
@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
 
   atomic_printf("%d: running %d syscalls ...\n", getpid(), num_syscalls);
   for (i = 0; i < num_syscalls; ++i) {
-    sys_gettid();
+    event_syscall();
   }
 
   if (0 == (child = fork())) {

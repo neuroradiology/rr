@@ -1,11 +1,11 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 #define DUMMY_FILE "dummy.txt"
 #define BUF_SIZE (1 << 24)
 
-int main(int argc, char* argv[]) {
+int main(void) {
   struct timeval ts;
   char* buf;
   int fd;
@@ -14,7 +14,7 @@ int main(int argc, char* argv[]) {
 
   gettimeofday(&ts, NULL);
 
-  buf = malloc(BUF_SIZE);
+  buf = xmalloc(BUF_SIZE);
   socketpair(AF_LOCAL, SOCK_STREAM, 0, sockfds);
 
   /* Big read() buffer. */
@@ -41,9 +41,11 @@ int main(int argc, char* argv[]) {
   test_assert(3 == nread && !strcmp(buf, "baz"));
 
   {
-    struct mmsghdr mmsg = { { 0 } };
-    struct iovec data = { 0 };
+    struct mmsghdr mmsg;
+    struct iovec data;
 
+    memset(&mmsg, 0, sizeof(mmsg));
+    memset(&data, 0, sizeof(data));
     mmsg.msg_hdr.msg_iov = &data;
     mmsg.msg_hdr.msg_iovlen = 1;
 

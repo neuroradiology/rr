@@ -1,9 +1,13 @@
 source `dirname $0`/util.sh
 
+# async_signal_syscalls is really about the syscallbuf and is horribly slow
+# with the syscallbuf, so don't bother with this test in no-syscallbuf.
+skip_if_no_syscall_buf
+
 timeslice=1000
 RECORD_ARGS="-c$timeslice"
 
-record async_signal_syscalls 9
+record async_signal_syscalls$bitness 9
 
 num_events=$(count_events)
 # This recording has a large number of events, and it's impractical to
@@ -14,7 +18,7 @@ num_events=$(count_events)
 stride=80
 for i in $(seq 1 $stride $num_events); do
     echo Checkpointing at event $i ...
-    debug async_signal_syscalls restart_finish "-g $i"
+    debug restart_finish "-g $i"
     if [[ "$leave_data" == "y" ]]; then
         break
     fi

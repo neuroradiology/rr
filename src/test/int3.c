@@ -5,14 +5,14 @@ static void breakpoint(void) {
    * Tests rely on that. */
 }
 
-#include "rrutil.h"
+#include "util.h"
 
-static void handle_sigtrap(int sig) {
+static void handle_sigtrap(__attribute__((unused)) int sig) {
   atomic_puts("EXIT-SUCCESS");
   _exit(0);
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   signal(SIGTRAP, handle_sigtrap);
 
   atomic_puts("raising SIGTRAP ...");

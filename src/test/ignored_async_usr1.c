@@ -1,9 +1,9 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-int main(int argc, char* argv[]) {
-  int dummy, i;
+int main(void) {
+  int dummy = 0, i;
 
   /* NB: since we're masking out the signal, there's no way for
    * us to tell whether or not it was actually delivered.  This

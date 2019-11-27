@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void breakpoint2(void) {
   int break_here = 1;
@@ -12,7 +12,7 @@ static void breakpoint3(void) {
   (void)break_here;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   /* NO SYSCALLS BETWEEN HERE AND RDTSC: next event for
    * replay must be rdtsc */
   rdtsc();

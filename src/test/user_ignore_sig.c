@@ -1,12 +1,12 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-static void handle_usr1(int sig) {
+static void handle_usr1(__attribute__((unused)) int sig) {
   test_assert("Shouldn't have caught SIGUSR1" && 0);
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   /* NB: unlike most other rr tests, this one verifies that rr
    * can "intervene" in execution to block signals, for the
    * purposes of unit tests.  This test *will* fail if not run

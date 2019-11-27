@@ -1,14 +1,12 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int low_priority_thread_scheduled;
 
-static int low_priority_thread_scheduled;
-
-static void* low_priority_thread(void* p) {
+static void* low_priority_thread(__attribute__((unused)) void* p) {
   setpriority(PRIO_PROCESS, 0, 4);
-  pthread_mutex_lock(&mutex);
+
   low_priority_thread_scheduled = 1;
   return NULL;
 }
@@ -16,13 +14,13 @@ static void* low_priority_thread(void* p) {
 int main(void) {
   pthread_t thread;
 
-  pthread_mutex_lock(&mutex);
   pthread_create(&thread, NULL, low_priority_thread, NULL);
-  pthread_mutex_unlock(&mutex);
 
-  sched_yield();
+  test_assert(!low_priority_thread_scheduled);
 
-  test_assert(low_priority_thread_scheduled);
+  do {
+    sched_yield();
+  } while (!low_priority_thread_scheduled);
 
   atomic_puts("EXIT-SUCCESS");
   return 0;

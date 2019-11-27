@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void C(void) { atomic_puts("in C"); }
 
@@ -17,7 +17,6 @@ static void A(void) {
 }
 
 int main(void) {
-
   atomic_puts("calling A");
   A();
   atomic_puts("finished A");

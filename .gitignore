@@ -14,9 +14,14 @@ Makefile
 Profile
 obj/
 .project
+.vscode/
 *.log
+*.orig
+*.rej
 *.pyc
 *.record
 *.replay
 .settings/
 Testing/
+.idea/
+.*.swp

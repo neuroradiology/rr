@@ -1,13 +1,13 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void breakpoint(void) {
   int break_here = 1;
   (void)break_here;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   pid_t child = fork();
   int status;
 

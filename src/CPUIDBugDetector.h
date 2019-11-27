@@ -5,11 +5,19 @@
 
 #include <stdint.h>
 
-class Task;
+namespace rr {
+
+class ReplayTask;
 
 /**
  * Helper to detect when the "CPUID can cause rcbs to be lost" bug is present.
  * See http://robert.ocallahan.org/2014/09/vmware-cpuid-conditional-branch.html
+ *
+ * This bug is caused by VMM optimizations described in
+ * https://www.usenix.org/system/files/conference/atc12/atc12-final158.pdf
+ * that cause instruction sequences related to CPUID to be optimized,
+ * eliminating the user-space execution of a conditional branch between two
+ * CPUID instructions (in some circumstances).
  */
 class CPUIDBugDetector {
 public:
@@ -25,17 +33,14 @@ public:
   /**
    * Call this when task t enters a traced syscall during replay.
    */
-  void notify_reached_syscall_during_replay(Task* t);
-  /**
-   * Returns true when the "CPUID can cause rcbs to be lost" bug has
-   * been detected.
-   */
-  bool is_cpuid_bug_detected() { return detected_cpuid_bug; }
+  void notify_reached_syscall_during_replay(ReplayTask* t);
 
 private:
   uint64_t trace_rcb_count_at_last_geteuid32;
   uint64_t actual_rcb_count_at_last_geteuid32;
   bool detected_cpuid_bug;
 };
+
+} // namespace rr
 
 #endif /* RR_CPUID_BUG_DETECTOR_H_ */

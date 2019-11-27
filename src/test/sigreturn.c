@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 /* Test to ensure that sigreturn restores all necessary registers */
 
@@ -102,9 +102,9 @@ static void init(void) {
 static const int xmm_good[XMM_SIZE / sizeof(int)] XMM_ALIGNMENT = {
   GOOD, GOOD + 1, GOOD + 2, GOOD + 3
 };
-static const int xmm_bad[XMM_SIZE / sizeof(int)] XMM_ALIGNMENT = {
-  BAD, BAD + 1, BAD + 2, BAD + 3
-};
+static const int xmm_bad[XMM_SIZE / sizeof(int)] XMM_ALIGNMENT = { BAD, BAD + 1,
+                                                                   BAD + 2,
+                                                                   BAD + 3 };
 
 #define ST_SIZE 10
 
@@ -113,7 +113,7 @@ static long double st_bad = -1.23456789;
 
 static int regnum;
 
-static void handle_usr1_xmm(int sig) {
+static void handle_usr1_xmm(__attribute__((unused)) int sig) {
   int xmm[XMM_SIZE / sizeof(int)] XMM_ALIGNMENT;
   xmm_ops[regnum].get(xmm);
   /* Print incoming xmm value to ensure any modifications made while
@@ -124,7 +124,7 @@ static void handle_usr1_xmm(int sig) {
   xmm_ops[regnum].set(xmm_bad);
 }
 
-static void handle_usr1_st(int sig) {
+static void handle_usr1_st(__attribute__((unused)) int sig) {
   char st[ST_SIZE];
   st_ops[regnum].get(st);
   /* Print incoming st value to ensure any modifications made while
@@ -135,16 +135,23 @@ static void handle_usr1_st(int sig) {
   st_ops[regnum].set(&st_bad);
 }
 
-int main(int argc, char* argv[]) {
+/* Some libcs use the xmm registers for signal mask manipulation in
+   `raise`. Provide a version that doesn't. */
+static void my_raise(int sig) {
+  pid_t tid = sys_gettid();
+  syscall(SYS_tgkill, tid, tid, sig);
+}
+
+int main(void) {
   init();
 
   signal(SIGUSR1, handle_usr1_xmm);
   for (regnum = 0; regnum < 8; ++regnum) {
     int xmm[XMM_SIZE / sizeof(int)] XMM_ALIGNMENT;
+    memcpy(xmm, xmm_bad, sizeof(xmm));
 
     xmm_ops[regnum].set(xmm_good);
-    raise(SIGUSR1);
-    memcpy(xmm, xmm_bad, sizeof(xmm));
+    my_raise(SIGUSR1);
     xmm_ops[regnum].get(xmm);
 
     test_assert("XMM register should have been preserved" &&
@@ -154,10 +161,10 @@ int main(int argc, char* argv[]) {
   signal(SIGUSR1, handle_usr1_st);
   for (regnum = 0; regnum < 8; ++regnum) {
     char st[ST_SIZE];
+    memcpy(st, &st_bad, sizeof(st));
 
     st_ops[regnum].set(&st_good);
-    raise(SIGUSR1);
-    memcpy(st, &st_bad, sizeof(st));
+    my_raise(SIGUSR1);
     st_ops[regnum].get(st);
 
     test_assert("ST register should have been preserved" &&

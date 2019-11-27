@@ -10,7 +10,7 @@ source `dirname $0`/util.sh
 # that loop has 2^30 iterations, so 100M events per reschedule sounds good.
 RECORD_ARGS="-c100000000"
 
-EXE=chew_cpu
+EXE=chew_cpu$bitness
 SYNC_TOKEN=spinning
 WAIT_SECS=1
 
@@ -27,8 +27,8 @@ rrpid=$(parent_pid_of $(pidof $EXE-$nonce))
 # reaches the spin() loop, e.g. with syscallbuf disabled it might be delivered
 # before rr has finished handling the syscalls of atomic_puts. But scheduling
 # variations should ensure that sometimes we reach spin() first.
-echo "  done.  Delivering SIGINT to $rrpid ..."
-kill -INT $rrpid
+echo "  done.  Delivering SIGTERM to $rrpid ..."
+kill -TERM $rrpid
 
 echo "  done."
 

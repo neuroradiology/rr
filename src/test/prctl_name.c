@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 /* Max name length is 16 bytes, *without* null terminator. */
 #define PRNAME_NUM_BYTES 16
@@ -13,14 +13,14 @@ const char fork_child_name[] = "fchild";
 const char exec_child_name[] = "echild";
 
 static void assert_prname_is(const char* tag, const char* name) {
-  char prname[PRNAME_NUM_BYTES] = { 0 };
+  char prname[PRNAME_NUM_BYTES] = "";
   test_assert(0 == prctl(PR_GET_NAME, prname));
 
   atomic_printf("%s: prname is '%s'; expecting '%s'\n", tag, prname, name);
   test_assert(!strcmp(prname, name));
 }
 
-static void* thread(void* unused) {
+static void* thread(__attribute__((unused)) void* unused) {
   pid_t child;
 
   assert_prname_is("thread", main_name);
@@ -50,7 +50,7 @@ static void* thread(void* unused) {
   return NULL;
 }
 
-char initial_name[PRNAME_NUM_BYTES] = { 0 };
+char initial_name[PRNAME_NUM_BYTES] = "";
 static void compute_initial_name(const char* exe_image) {
   const char* basename = strrchr(exe_image, '/');
   if (basename) {
@@ -80,6 +80,10 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  assert_prname_is("main", initial_name);
+
+  test_assert(-1 == prctl(PR_SET_NAME, NULL));
+  test_assert(EFAULT == errno);
   assert_prname_is("main", initial_name);
 
   prctl(PR_SET_NAME, main_name);

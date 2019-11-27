@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 #define NUM_THREADS 10
 #define NUM_TRIALS 1000
@@ -21,14 +21,17 @@ static void* thread(void* idp) {
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   pthread_mutexattr_t attr;
   pthread_t threads[NUM_THREADS];
-  int i;
+  int i, err;
 
   pthread_mutexattr_init(&attr);
   test_assert(0 == pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT));
-  test_assert(0 == pthread_mutex_init(&lock, &attr));
+  if ((err = pthread_mutex_init(&lock, &attr))) {
+    test_assert(ENOTSUP == err);
+    test_assert(0 == pthread_mutex_init(&lock, NULL));
+  }
 
   for (i = 0; i < NUM_THREADS; ++i) {
     test_assert(0 ==

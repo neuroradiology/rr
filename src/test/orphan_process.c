@@ -1,8 +1,8 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   /* Descendant process will write one byte to the pipe to signal that it's
    * complete */
   int pipe_fds[2];
@@ -25,7 +25,7 @@ int main(int argc, char* argv[]) {
     exit(0);
   }
 
-  /* In granchild */
+  /* In grandchild */
   /* Wait for parent to die */
   while (getppid() == dyingchild_pid) {
     sched_yield();

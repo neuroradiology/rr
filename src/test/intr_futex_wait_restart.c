@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static const char start_token = '!';
 static const char sentinel_token = ' ';
@@ -24,7 +24,7 @@ static void cond_wait(int secs) {
   test_assert(ETIMEDOUT == pthread_cond_timedwait(&cond, &lock, &ts));
 }
 
-static void sighandler(int sig) {
+static void sighandler(__attribute__((unused)) int sig) {
   test_assert(sys_gettid() == reader_tid);
   ++reader_caught_signal;
 
@@ -33,7 +33,7 @@ static void sighandler(int sig) {
   atomic_puts("r: ... wait done");
 }
 
-static void* reader_thread(void* dontcare) {
+static void* reader_thread(__attribute__((unused)) void* dontcare) {
   char token = start_token;
   struct sigaction act;
   int readsock = sockfds[1];
@@ -46,13 +46,13 @@ static void* reader_thread(void* dontcare) {
 
   flags = SA_RESTART;
 
-  memset(&act, 0, sizeof(act));
   act.sa_handler = sighandler;
+  sigemptyset(&act.sa_mask);
   act.sa_flags = flags;
   sigaction(SIGUSR1, &act, NULL);
 
-  memset(&act, 0, sizeof(act));
   act.sa_handler = SIG_IGN;
+  sigemptyset(&act.sa_mask);
   act.sa_flags = flags;
   sigaction(SIGUSR2, &act, NULL);
 
@@ -69,7 +69,7 @@ static void* reader_thread(void* dontcare) {
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   char token = start_token;
   struct timeval ts;
 

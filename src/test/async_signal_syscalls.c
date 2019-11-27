@@ -1,20 +1,32 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static sig_atomic_t caught_usr1;
 
 static void handle_usr1(int sig) {
   test_assert(SIGUSR1 == sig);
-  caught_usr1 = 1;
   atomic_puts("caught usr1");
+  caught_usr1 = 1;
 }
 
-int main(int argc, char** argv) {
+static void* do_thread(__attribute__((unused)) void* p) {
+  while (1) {
+    sched_yield();
+  }
+  return NULL;
+}
+
+int main(int argc, char* argv[]) {
   struct timespec ts;
   struct timeval tv;
   int num_its;
   int i;
+  pthread_t thread;
+
+  /* Create an extra thread so context switches can happen
+     and SCHED events will be recorded. */
+  pthread_create(&thread, NULL, do_thread, NULL);
 
   test_assert(argc == 2);
   num_its = atoi(argv[1]);
@@ -23,6 +35,8 @@ int main(int argc, char** argv) {
   atomic_printf("Running 2^%d iterations\n", num_its);
 
   signal(SIGUSR1, handle_usr1);
+
+  atomic_puts("ready\n");
 
   /* Driver scripts choose the number of iterations based on
    * their needs. */
@@ -38,6 +52,9 @@ int main(int argc, char** argv) {
     gettimeofday(&tv, NULL);
     clock_gettime(CLOCK_MONOTONIC, &ts);
     gettimeofday(&tv, NULL);
+    if (caught_usr1) {
+      break;
+    }
   }
 
   atomic_puts("EXIT-SUCCESS");

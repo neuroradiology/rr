@@ -1,6 +1,6 @@
 import re
 
-from rrutil import *
+from util import *
 
 BAD_TOKEN = r'EXIT-SUCCESS'
 GOOD_TOKEN = r'Inferior 1 \(process \d+\) exited normally'
@@ -8,7 +8,7 @@ GOOD_TOKEN = r'Inferior 1 \(process \d+\) exited normally'
 def observe_child_crash_and_exit():
     expect_gdb('Program received signal SIGSEGV')
 
-    send_gdb('c\n')
+    send_gdb('c')
     for line in iterlines_both():
         m = re.search(BAD_TOKEN, line)
         if m:
@@ -17,10 +17,10 @@ def observe_child_crash_and_exit():
         if m:
             return
 
-send_gdb('c\n')
+send_gdb('c')
 observe_child_crash_and_exit()
 
-restart_replay_at_end()
+restart_replay()
 observe_child_crash_and_exit()
 
 ok()

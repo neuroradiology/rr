@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void breakpoint(void) {
   int break_here = 1;
@@ -13,7 +13,7 @@ struct big {
   char bytes[8192];
 };
 
-int main(int argc, char* argv[]) {
+int main(void) {
   struct big big;
 
   memset(&big, 0x5a, sizeof(big));

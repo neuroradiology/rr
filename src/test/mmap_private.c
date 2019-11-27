@@ -1,18 +1,18 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void breakpoint(void) {
   int break_here = 1;
   (void)break_here;
 }
 
-int main(int argc, char* argv[]) {
+int main(__attribute__((unused)) int argc, char* argv[]) {
   size_t num_bytes = sysconf(_SC_PAGESIZE);
   int fd = open(argv[0], O_RDONLY);
   int* wpage;
   int* rpage;
-  int i;
+  size_t i;
 
   test_assert(fd >= 0);
 

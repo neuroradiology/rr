@@ -3,7 +3,10 @@
 # some helpers for common test operations.  A driver file foo.run
 # will want to include this file as follows
 #
-#  source util.sh foo "$@"
+#  source `dirname $0`/util.sh
+#
+# It is essential that util.sh inherit its $n parameters from the
+# driver script's parameters.
 #
 # Most tests are either "compare_test"s, which check that record and
 # replay successfully complete and the output is the same, or,
@@ -37,23 +40,30 @@ function delay_kill { sig=$1; delay_secs=$2; proc=$3
     done
 
     if [[ "$num" -gt 1 ]]; then
-        leave_data=y
+        test_passed=n
         echo FAILED: "$num" of "'$proc'" >&2
         exit 1
     elif [[ -z "$pid" ]]; then
-        leave_data=y
+        test_passed=n
         echo FAILED: process "'$proc'" not located >&2
         exit 1
     fi
 
+    # Wait for the test to print "ready", indicating it has completed
+    # any required setup.
+    until grep -q ready record.out; do
+        sleep 0
+    done
+
     kill -s $sig $pid
     if [[ $? != 0 ]]; then
-        leave_data=y
-        echo FAILED: signal $sig not delivered to "'$proc'" >&2
-        exit 1
+        # Sometimes we fail to deliver a signal to a process because
+        # it finished first (due to scheduling races). That's a benign
+        # failure.
+        echo signal $sig not delivered to "'$proc'", letting test succeed anyway
+    else
+        echo Successfully delivered signal $sig to "'$proc'"
     fi
-
-    echo Successfully delivered signal $sig to "'$proc'"
 }
 
 function fatal { #...
@@ -63,12 +73,13 @@ function fatal { #...
 
 function onexit {
     cd
-    if [[ "$leave_data" != "y" ]]; then
+    if [[ "$test_passed" == "y" ]]; then
         rm -rf $workdir
     else
-        echo Test $TESTNAME failed, leaving behind $workdir.
+        echo Test $TESTNAME failed, leaving behind $workdir
         echo To replay the failed test, run
         echo " " _RR_TRACE_DIR="$workdir" rr replay
+        exit 1
     fi
 }
 
@@ -80,52 +91,76 @@ function usage {
     echo Usage: "util.sh TESTNAME [LIB_ARG] [OBJDIR]"
 }
 
-DEFAULT_FLAGS="--suppress-environment-warnings --check-cached-mmaps --fatal-errors"
-# Don't bind record/replay tracees to the same logical CPU.  When we
-# do that, the tests take impractically long to run.
-#
-# TODO: find a way to run faster with CPU binding
-GLOBAL_OPTIONS="$DEFAULT_FLAGS"
-# ... but tests that DO want CPU binding can override the default by
-# setting
-#
-#   GLOBAL_OPTIONS="$GLOBAL_OPTIONS_BIND_CPU"
-#
-# just after sourcing this file.
-GLOBAL_OPTIONS_BIND_CPU="$DEFAULT_FLAGS"
+GLOBAL_OPTIONS="--suppress-environment-warnings --check-cached-mmaps --fatal-errors"
 
-LIB_ARG=$1
-OBJDIR=$2
+SRCDIR=`dirname $0`/../..
+SRCDIR=`realpath $SRCDIR`
+
+TESTNAME=$1
+if [[ "$TESTNAME" == "" ]]; then
+    [[ $0 =~ ([A-Za-z0-9_]+)\.run$ ]] || fatal "FAILED: bad test script name"
+    TESTNAME=${BASH_REMATCH[1]}
+fi
+if [[ $TESTNAME =~ ([A-Za-z0-9_]+)_32$ ]]; then
+    bitness=_32
+    TESTNAME_NO_BITNESS=${BASH_REMATCH[1]}
+else
+    TESTNAME_NO_BITNESS=$TESTNAME
+fi
+LIB_ARG=$2
+if [[ "$LIB_ARG" == "" ]]; then
+    LIB_ARG=-b
+fi
+OBJDIR=$3
 if [[ "$OBJDIR" == "" ]]; then
     # Default to assuming that the user's working directory is the
-    # test/ directory within the rr clone.
-    OBJDIR=`realpath ../../../obj`
+    # src/test/ directory within the rr clone.
+    OBJDIR="$SRCDIR/../obj"
 fi
-TESTNAME=$3
-if [[ "$TESTNAME" == "" ]]; then
-    [[ $0 =~ ([A-Za-z0-9_]+)\.run ]] || fatal "FAILED: bad test script name"
-    TESTNAME=${BASH_REMATCH[1]}
+if [[ ! -d "$OBJDIR" ]]; then
+    fatal "FAILED: objdir missing"
+fi
+OBJDIR=`realpath $OBJDIR`
+TIMEOUT=$4
+if [[ "$TIMEOUT" == "" ]]; then
+    TIMEOUT=120
 fi
 
 # The temporary directory we create for this test run.
 workdir=
 # Did the test pass?  If not, then we'll leave the recording and
-# output around for developers to debug.
-leave_data=n
+# output around for developers to debug, and exit with a nonzero
+# exit code.
+test_passed=y
 # The unique ID allocated to this test directory.
 nonce=
 
 # Set up the environment and working directory.
-SRCDIR="${OBJDIR}/../rr"
 TESTDIR="${SRCDIR}/src/test"
 
+# Make rr treat temp files as durable. This saves copying all test
+# binaries into the trace.
+export RR_TRUST_TEMP_FILES=1
+
+# Set options to find rr and resource files in the expected places.
 export PATH="${OBJDIR}/bin:${PATH}"
-export LD_LIBRARY_PATH="${OBJDIR}/lib:/usr/local/lib:${LD_LIBRARY_PATH}"
+GLOBAL_OPTIONS="${GLOBAL_OPTIONS} --resource-path=${OBJDIR}"
 
 which rr >/dev/null 2>&1
 if [[ "$?" != "0" ]]; then
     fatal FAILED: rr not found in PATH "($PATH)"
 fi
+
+if [[ ! -d $SRCDIR ]]; then
+    fatal FAILED: SRCDIR "($SRCDIR)" not found. objdir and srcdir must share the same parent.
+fi
+
+if [[ ! -d $TESTDIR ]]; then
+    fatal FAILED: TESTDIR "($TESTDIR)" not found.
+fi
+
+# Our test programs intentionally crash a lot. Don't generate coredumps for them.
+ulimit -c 0
 
 # NB: must set up the trap handler *before* mktemp
 trap onexit EXIT
@@ -135,7 +170,8 @@ cd $workdir
 # XXX technically the trailing -XXXXXXXXXX isn't unique, since there
 # could be "foo-123456789" and "bar-123456789", but if that happens,
 # buy me a lottery ticket.
-nonce=${workdir#/tmp/rr-test-$TESTNAME-}
+baseworkdir=$(basename ${workdir})
+nonce=${baseworkdir#rr-test-$TESTNAME-}
 
 ##--------------------------------------------------
 ## Now we come to the helpers available to test runners.  This is the
@@ -165,23 +201,26 @@ function skip_if_syscall_buf {
     fi
 }
 
-function just_record { exe=$1; exeargs=$2;
-    _RR_TRACE_DIR="$workdir" \
-        rr $GLOBAL_OPTIONS record $LIB_ARG $RECORD_ARGS $exe $exeargs 1> record.out
+function just_record { exe="$1"; exeargs=$2;
+    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT record.err \
+        rr $GLOBAL_OPTIONS record $LIB_ARG $RECORD_ARGS "$exe" $exeargs 1> record.out 2> record.err
 }
 
 function save_exe { exe=$1;
-    cp ${OBJDIR}/bin/$exe $exe-$nonce
-}    
+    cp "${OBJDIR}/bin/$exe" "$exe-$nonce"
+}
 
-function record { exe=$1; exeargs=$2;
-    save_exe $exe
-    just_record ./$exe-$nonce "$exeargs"
+# Record $exe with $exeargs.
+function record { exe=$1;
+    save_exe "$exe"
+    just_record "./$exe-$nonce" "$2 $3 $4 $5"
 }
 
 #  record_async_signal <signal> <delay-secs> <test>
 #
 # Record $test, delivering $signal to it after $delay-secs.
+# If for some reason delay_kill doesn't run in time, the signal
+# will not be delivered but the test will not be aborted.
 function record_async_signal { sig=$1; delay_secs=$2; exe=$3; exeargs=$4;
     delay_kill $sig $delay_secs $exe-$nonce &
     record $exe $exeargs
@@ -189,26 +228,38 @@ function record_async_signal { sig=$1; delay_secs=$2; exe=$3; exeargs=$4;
 }
 
 function replay { replayflags=$1
-    _RR_TRACE_DIR="$workdir" \
+    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT replay.err \
         rr $GLOBAL_OPTIONS replay -a $replayflags 1> replay.out 2> replay.err
 }
 
-#  debug <exe> <expect-script-name> [replay-args]
+function do_ps { psflags=$1
+    _RR_TRACE_DIR="$workdir" \
+        rr $GLOBAL_OPTIONS ps $psflags
+}
+
+#  debug <expect-script-name> [replay-args]
 #
 # Load the "expect" script to drive replay of the recording of |exe|.
-function debug { exe=$1; expectscript=$2; replayargs=$3
-    _RR_TRACE_DIR="$workdir" \
-        python $TESTDIR/$expectscript.py $exe-$nonce \
-        rr $GLOBAL_OPTIONS replay -x $TESTDIR/test_setup.gdb $replayargs
+function debug { expectscript=$1; replayargs=$2
+    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT debug.err \
+        python3 $TESTDIR/$expectscript.py \
+        rr $GLOBAL_OPTIONS replay -o-n -x $TESTDIR/test_setup.gdb $replayargs
     if [[ $? == 0 ]]; then
         passed
     else
         failed "debug script failed"
+        echo "--------------------------------------------------"
+        echo "gdb_rr.log:"
+        cat gdb_rr.log
+        echo "--------------------------------------------------"
+        echo "debug.err:"
+        cat debug.err
+        echo "--------------------------------------------------"
     fi
 }
 
 function failed { msg=$1;
-    leave_data=y
+    test_passed=n
     echo "Test '$TESTNAME' FAILED: $msg"
 }
 
@@ -220,22 +271,35 @@ function passed {
 # output match; (iii) the supplied token was found in the output.
 # Otherwise the test fails.
 function check { token=$1;
-    if [ ! -f record.out -o ! -f replay.err -o ! -f replay.out ]; then
+    if [ ! -f record.out -o ! -f replay.err -o ! -f replay.out -o ! -f record.err ]; then
         failed "output files not found."
+    elif [[ $(cat record.err) != "" ]]; then
+        failed ": error during recording:"
+        echo "--------------------------------------------------"
+        cat record.err
+        echo "--------------------------------------------------"
+        echo "record.out:"
+        echo "--------------------------------------------------"
+        cat record.out
+        echo "--------------------------------------------------"
+    elif [[ "$token" != "" && "record.out" != $(grep -l "$token" record.out) ]]; then
+        failed ": token '$token' not in record.out:"
+        echo "--------------------------------------------------"
+        cat record.out
+        echo "--------------------------------------------------"
     elif [[ $(cat replay.err) != "" ]]; then
         failed ": error during replay:"
         echo "--------------------------------------------------"
         cat replay.err
         echo "--------------------------------------------------"
+        echo "replay.out:"
+        echo "--------------------------------------------------"
+        cat replay.out
+        echo "--------------------------------------------------"
     elif [[ $(diff record.out replay.out) != "" ]]; then
         failed ": output from recording different than replay"
         echo "diff -U8 $workdir/record.out $workdir/replay.out"
         diff -U8 record.out replay.out
-    elif [[ "$token" != "" && "record.out" != $(grep -l "$token" record.out) ]]; then
-        failed ": token '$token' not in output:"
-        echo "--------------------------------------------------"
-        cat record.out
-        echo "--------------------------------------------------"
     else
         passed
     fi
@@ -266,9 +330,8 @@ function compare_test { token=$1; replayflags=$2;
 # using the "expect" script $test-name.py, which is responsible for
 # computing test pass/fail.
 function debug_test {
-    test=$TESTNAME
-    record $test
-    debug $test $test
+    record $TESTNAME
+    debug $TESTNAME_NO_BITNESS
 }
 
 # Return the number of events in the most recent local recording.
@@ -315,8 +378,8 @@ function checkpoint_test { exe=$1; min=$2; max=$3;
     stride=$(rand_range $min $max)
     for i in $(seq 1 $stride $num_events); do
         echo Checkpointing at event $i ...
-        debug $exe restart_finish "-g $i"
-        if [[ "$leave_data" == "y" ]]; then
+        debug restart_finish "-g $i"
+        if [[ "$test_passed" != "y" ]]; then
             break
         fi
     done

@@ -13,8 +13,12 @@
 #include "Registers.h"
 #include "Ticks.h"
 
+namespace rr {
+
 class TraceReader;
 class TraceWriter;
+
+typedef int64_t FrameTime;
 
 /**
  * A trace_frame is one "trace event" from a complete trace.  During
@@ -26,31 +30,17 @@ class TraceWriter;
  */
 class TraceFrame {
 public:
-  typedef uint32_t Time;
+  TraceFrame(FrameTime global_time, pid_t tid, const Event& event,
+             Ticks tick_count, double monotonic_time = 0);
+  TraceFrame() : global_time(0), tid_(0), ticks_(0), monotonic_time_(0) {}
 
-  TraceFrame(Time global_time, pid_t tid, EncodedEvent event) {
-    basic_info.global_time = global_time;
-    basic_info.tid = tid;
-    basic_info.ev = event;
-    exec_info.ticks = 0;
-  }
-  TraceFrame() {
-    basic_info.global_time = 0;
-    basic_info.tid = 0;
-    basic_info.ev.encoded = 0;
-    exec_info.ticks = 0;
-  }
+  FrameTime time() const { return global_time; }
+  pid_t tid() const { return tid_; }
+  const Event& event() const { return ev; }
+  Ticks ticks() const { return ticks_; }
+  double monotonic_time() const { return monotonic_time_; }
 
-  void set_exec_info(Ticks ticks, const Registers& regs,
-                     const PerfCounters::Extra* extra_perf_values,
-                     const ExtraRegisters* extra_regs);
-
-  Time time() const { return basic_info.global_time; }
-  pid_t tid() const { return basic_info.tid; }
-  EncodedEvent event() const { return basic_info.ev; }
-
-  Ticks ticks() const { return exec_info.ticks; }
-  const Registers& regs() const { return exec_info.recorded_regs; }
+  const Registers& regs() const { return recorded_regs; }
   const ExtraRegisters& extra_regs() const { return recorded_extra_regs; }
 
   /**
@@ -71,21 +61,19 @@ private:
   friend class TraceReader;
   friend class TraceWriter;
 
-  struct {
-    Time global_time;
-    pid_t tid;
-    EncodedEvent ev;
-  } basic_info;
+  FrameTime global_time;
+  pid_t tid_;
+  Event ev;
+  Ticks ticks_;
+  double monotonic_time_;
 
-  struct {
-    Ticks ticks;
-    PerfCounters::Extra extra_perf_values;
-    Registers recorded_regs;
-  } exec_info;
+  Registers recorded_regs;
 
   // Only used when has_exec_info, but variable length (and usually not
   // present) so we don't want to stuff it into exec_info
   ExtraRegisters recorded_extra_regs;
 };
+
+} // namespace rr
 
 #endif /* RR_TRACE_FRAME_H_ */

@@ -1,8 +1,8 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   /* Fork-and-exec 'echo'.
      The exec may fail if 'bash' is 64-bit and rr doesn't support
      64-bit processes. That's fine; the test should still pass. We're

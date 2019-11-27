@@ -1,19 +1,13 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-int main(int argc, char* argv[]) {
-  pid_t sid1;
-  pid_t sid2;
+int main(void) {
+  pid_t sid = getsid(0);
+  atomic_printf("getsid(0) session ID: %d\n", sid);
+  test_assert(sid > 0);
 
-  sid1 = getsid(0);
-  sid2 = getsid(sid1);
-  atomic_printf("getsid(0) session ID: %d\n", sid1);
-  atomic_printf("getsid(getsid(0)) session ID: %d\n", sid2);
-
-  if (sid1 == sid2) {
-    atomic_puts("EXIT-SUCCESS");
-  }
+  atomic_puts("EXIT-SUCCESS");
 
   return 0;
 }

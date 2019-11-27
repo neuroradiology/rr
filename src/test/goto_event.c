@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void first_breakpoint(void) {
   int break_here = 1;
@@ -18,11 +18,9 @@ static void* child_thread(void* num_syscallsp) {
 
   first_breakpoint();
 
-  /* NB: this test assumes that gettid() produces at least one
-   * trace event per syscall. */
   atomic_printf("%d: running %d syscalls ...\n", getpid(), num_syscalls);
   for (i = 0; i < num_syscalls; ++i) {
-    (void)sys_gettid();
+    event_syscall();
   }
 
   second_breakpoint();

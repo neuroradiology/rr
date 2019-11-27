@@ -1,11 +1,11 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static int caught_signal;
-static void handle_signal(int sig) { ++caught_signal; }
+static void handle_signal(__attribute__((unused)) int sig) { ++caught_signal; }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   int err;
 
   signal(SIGALRM, handle_signal);

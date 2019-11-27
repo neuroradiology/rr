@@ -1,27 +1,29 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static int num_signals_caught;
 
-static pid_t gettid(void) { return syscall(SYS_gettid); }
-
-static int tgkill(int tgid, int tid, int sig) {
-  return syscall(SYS_tgkill, tgid, tid, sig);
-}
+#define tgkill(tgid, tid, sig) \
+  syscall(SYS_tgkill, (int)(tgid), (int)(tid), (int)(sig))
 
 static void sighandler(int sig) {
-  atomic_printf("Task %d got signal %d\n", gettid(), sig);
+  atomic_printf("Task %d got signal %d\n", sys_gettid(), sig);
   ++num_signals_caught;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   signal(SIGUSR1, sighandler);
   signal(SIGUSR2, sighandler);
-  tgkill(getpid(), gettid(), SIGUSR1);
-  tgkill(getpid(), gettid(), SIGUSR2);
+  tgkill(getpid(), sys_gettid(), SIGUSR1);
+  tgkill(getpid(), sys_gettid(), SIGUSR2);
 
   test_assert(2 == num_signals_caught);
+
+  syscall(SYS_tkill, sys_gettid(), SIGUSR1);
+  syscall(SYS_tkill, sys_gettid(), SIGUSR2);
+
+  test_assert(4 == num_signals_caught);
 
   atomic_puts("EXIT-SUCCESS");
   return 0;

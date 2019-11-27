@@ -1,16 +1,22 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import assembly_templates
-import StringIO
+from io import StringIO
 import os
 import string
 import sys
 import syscalls
 
+def arch_syscall_number(arch, syscall):
+    s = getattr(syscall[1], arch)
+    if s == None:
+        s = -1
+    return s
+
 def write_syscall_enum(f, arch):
     f.write("enum Syscalls {\n")
     undefined_syscall = -1
-    for name, obj in sorted(syscalls.all(), key=lambda x: getattr(x[1], arch)):
+    for name, obj in sorted(syscalls.all(), key=lambda x: arch_syscall_number(arch, x)):
         syscall_number = getattr(obj, arch)
         if syscall_number is not None:
             enum_number = syscall_number
@@ -22,66 +28,53 @@ def write_syscall_enum(f, arch):
     f.write("};\n")
     f.write("\n")
 
-def write_is_always_emulated_syscall(f):
-    semantics_to_retval = { syscalls.ReplaySemantics.EMU: 'true',
-                            syscalls.ReplaySemantics.EXEC: 'false',
-                            syscalls.ReplaySemantics.EXEC_RET_EMU: 'false',
-                            syscalls.ReplaySemantics.MAY_EXEC: 'false' }
-
-    f.write("template <typename Arch> static bool is_always_emulated_syscall_arch(int syscall);\n");
-    f.write("\n");
-    for specializer, arch in [("X86Arch", "x86"), ("X64Arch", "x64")]:
-        f.write("template<> bool is_always_emulated_syscall_arch<%s>(int syscallno) {\n" % specializer)
-        f.write("  switch (syscallno) {\n")
-        for name, obj in syscalls.all():
-            f.write("    case %s::%s: return %s;\n"
-                    % (specializer, name, semantics_to_retval[obj.semantics]))
-        f.write("    default:\n")
-        f.write("      FATAL() << \"Unknown syscall \" << syscallno;\n")
-        f.write("      return true;\n")
-        f.write("  }\n")
-        f.write("}\n")
-        f.write("\n")
+def write_syscall_enum_for_tests(f, arch):
+    f.write("enum Syscalls {\n")
+    undefined_syscall = -1
+    for name, obj in sorted(syscalls.all(), key=lambda x: arch_syscall_number(arch, x)):
+        syscall_number = getattr(obj, arch)
+        if syscall_number is not None:
+            enum_number = syscall_number
+        else:
+            enum_number = undefined_syscall
+            undefined_syscall -= 1
+        f.write("  RR_%s = %d,\n" % (name, enum_number))
+    f.write("};\n")
+    f.write("\n")
 
 def write_syscallname_arch(f):
-    f.write("template <typename Arch> static const char* syscallname_arch(int syscall);\n")
+    f.write("template <typename Arch> static std::string syscallname_arch(int syscall);\n")
     f.write("\n");
     for specializer, arch in [("X86Arch", "x86"), ("X64Arch", "x64")]:
-        f.write("template <> const char* syscallname_arch<%s>(int syscall) {\n" % specializer)
+        f.write("template <> std::string syscallname_arch<%s>(int syscall) {\n" % specializer)
         f.write("  switch (syscall) {\n");
         def write_case(name):
             f.write("    case %(specializer)s::%(syscall)s: return \"%(syscall)s\";\n"
                     % { 'specializer': specializer, 'syscall': name })
         for name, _ in syscalls.for_arch(arch):
             write_case(name)
-        f.write("    default: return \"<unknown-syscall>\";\n")
+        f.write("    default: {")
+        f.write("      char buf[100];")
+        f.write("      sprintf(buf, \"<unknown-syscall-%d>\", syscall);")
+        f.write("      return buf;\n")
+        f.write("    }\n")
         f.write("  }\n")
         f.write("}\n")
         f.write("\n")
 
 def write_syscall_record_cases(f):
     def write_recorder_for_arg(syscall, arg):
-        arg_descriptor = getattr(syscall, arg, None)
-        if arg_descriptor is None:
-            return
+        arg_descriptor = getattr(syscall, 'arg' + str(arg), None)
         if isinstance(arg_descriptor, str):
-            f.write("    t->record_remote(remote_ptr<%s>(t->regs().%s()));\n"
+            f.write("    syscall_state.reg_parameter<%s>(%d);\n"
                     % (arg_descriptor, arg))
-        elif isinstance(arg_descriptor, syscalls.DynamicSize):
-            f.write("    t->record_remote(remote_ptr<void>(t->regs().%s()), %s);\n"
-                    % (arg, arg_descriptor.size_expr))
-        elif isinstance(arg_descriptor, syscalls.NullTerminatedString):
-            f.write("    t->record_remote_str(remote_ptr<void>(t->regs().%s()));\n" % arg)
-        else:
-            # Not reached
-            assert None
     for name, obj in syscalls.all():
         # Irregular syscalls will be handled by hand-written code elsewhere.
         if isinstance(obj, syscalls.RegularSyscall):
             f.write("  case Arch::%s:\n" % name)
-            for arg in syscalls.RegularSyscall.ARGUMENT_SLOTS:
+            for arg in range(1,6):
                 write_recorder_for_arg(obj, arg)
-            f.write("    break;\n")
+            f.write("    return PREVENT_SWITCH;\n")
 
 has_syscall = string.Template("""inline bool
 has_${syscall}_syscall(SupportedArch arch) {
@@ -91,8 +84,9 @@ has_${syscall}_syscall(SupportedArch arch) {
     case x86_64:
       return X64Arch::${syscall} >= 0;
     default:
-      assert(0 && "unsupported architecture");
-  }  
+      DEBUG_ASSERT(0 && "unsupported architecture");
+      return false;
+  }
 }
 """)
 
@@ -104,8 +98,9 @@ is_${syscall}_syscall(int syscallno, SupportedArch arch) {
     case x86_64:
       return syscallno >= 0 && syscallno == X64Arch::${syscall};
     default:
-      assert(0 && "unsupported architecture");
- }
+      DEBUG_ASSERT(0 && "unsupported architecture");
+      return false;
+  }
 }
 """)
 
@@ -113,13 +108,14 @@ syscall_number = string.Template("""inline int
 syscall_number_for_${syscall}(SupportedArch arch) {
   switch (arch) {
     case x86:
-      assert(X86Arch::${syscall} >= 0);
+      DEBUG_ASSERT(X86Arch::${syscall} >= 0);
       return X86Arch::${syscall};
     case x86_64:
-      assert(X64Arch::${syscall} >= 0);
+      DEBUG_ASSERT(X64Arch::${syscall} >= 0);
       return X64Arch::${syscall};
     default:
-      assert(0 && "unsupported architecture");
+      DEBUG_ASSERT(0 && "unsupported architecture");
+      return -1;
   }
 }
 """)
@@ -134,24 +130,6 @@ def write_syscall_helper_functions(f):
     for name, obj in syscalls.all():
         write_helpers(name)
 
-def write_syscall_defs_table(f):
-    for specializer, arch in [("X86Arch", "x86"), ("X64Arch", "x64")]:
-        f.write("template<> syscall_defs<%s>::Table syscall_defs<%s>::table = {\n"
-                % (specializer, specializer))
-        arch_syscalls = sorted(syscalls.for_arch(arch), key=lambda x: getattr(x[1], arch))
-        for name, obj in arch_syscalls:
-            if isinstance(obj, syscalls.RegularSyscall):
-                recorded_args = [arg for arg in syscalls.RegularSyscall.ARGUMENT_SLOTS
-                                 if getattr(obj, arg, None) is not None]
-                f.write("  { %s::%s, { rep_%s, %d } },\n"
-                        % (specializer, name, obj.semantics, len(recorded_args)))
-            elif isinstance(obj, (syscalls.IrregularSyscall, syscalls.RestartSyscall)):
-                f.write("  { %s::%s, { rep_IRREGULAR, -1 } },\n" % (specializer, name))
-            elif isinstance(obj, syscalls.UnsupportedSyscall):
-                pass
-        f.write("};\n")
-        f.write("\n")
-
 def write_check_syscall_numbers(f):
     for name, obj in syscalls.all():
         # XXX hard-coded to x86 currently
@@ -163,10 +141,10 @@ def write_check_syscall_numbers(f):
 generators_for = {
     'AssemblyTemplates': lambda f: assembly_templates.generate(f),
     'CheckSyscallNumbers': write_check_syscall_numbers,
-    'IsAlwaysEmulatedSyscall': write_is_always_emulated_syscall,
-    'SyscallDefsTable': write_syscall_defs_table,
     'SyscallEnumsX86': lambda f: write_syscall_enum(f, 'x86'),
     'SyscallEnumsX64': lambda f: write_syscall_enum(f, 'x64'),
+    'SyscallEnumsForTestsX86': lambda f: write_syscall_enum_for_tests(f, 'x86'),
+    'SyscallEnumsForTestsX64': lambda f: write_syscall_enum_for_tests(f, 'x64'),
     'SyscallnameArch': write_syscallname_arch,
     'SyscallRecordCase': write_syscall_record_cases,
     'SyscallHelperFunctions': write_syscall_helper_functions,
@@ -182,7 +160,7 @@ def main(argv):
     else:
         before = ""
 
-    stream = StringIO.StringIO()
+    stream = StringIO()
     generators_for[base](stream)
     after = stream.getvalue()
     stream.close()

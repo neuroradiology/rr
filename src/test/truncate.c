@@ -2,17 +2,22 @@
 
 #define _FILE_OFFSET_BITS 64
 
-#include "rrutil.h"
+#include "util.h"
 
 #define TEST_FILE "foo.txt"
 
 ssize_t get_file_size(const char* filename) {
-  struct stat st;
-  test_assert(0 == stat(filename, &st));
-  return st.st_size;
+  struct stat* st;
+  ssize_t result;
+
+  ALLOCATE_GUARD(st, 'x');
+  test_assert(0 == stat(filename, st));
+  result = st->st_size;
+  FREE_GUARD(st);
+  return result;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   int fd;
   ssize_t size;
 

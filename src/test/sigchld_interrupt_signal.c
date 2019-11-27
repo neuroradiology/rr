@@ -1,10 +1,10 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   pid_t c;
-  int dummy, i;
+  int dummy = 0, i;
   int status;
 
   atomic_puts("forking child");

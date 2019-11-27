@@ -9,8 +9,12 @@
 #include <vector>
 
 #include "ScopedFd.h"
-#include "task.h"
 
+namespace rr {
+
+class AddressSpace;
+class EmuFs;
+class KernelMapping;
 class ReplaySession;
 class Session;
 class Task;
@@ -35,7 +39,7 @@ class Task;
  * F_0 at trace time t_0 has the same (device, inode) ID as a
  * different file F_1 at trace time t_1.  By definition, if the inode
  * ID was recycled in [t_0, t_1), then all references to F_0 must have
- * been dropped in that inverval.  A corollary of that is that all
+ * been dropped in that interval.  A corollary of that is that all
  * memory mappings of F_0 must have been fully unmapped in the
  * interval.  As per the first long comment in |gc()| below, an
  * emulated file can only be "live" during replay if some tracee still
@@ -61,21 +65,9 @@ public:
   ~EmuFile();
 
   /**
-   * Return a copy of this file.  See |create()| for the meaning
-   * of |fs_tag|.
-   */
-  shr_ptr clone();
-
-  /**
    * Return the fd of the real file backing this.
    */
   const ScopedFd& fd() const { return file; }
-
-  /**
-   * Return the path of the original file from recording, the
-   * one this is emulating.
-   */
-  const std::string emu_path() const { return orig_path; }
 
   /**
    * Return a pathname referring to the fd of this in this
@@ -84,17 +76,36 @@ public:
   std::string proc_path() const;
 
   /**
-   * Mark/unmark/check to see if this file is marked.
+   * Return the path of the original file from recording, the
+   * one this is emulating.
    */
-  void mark() { is_marked = true; }
-  bool marked() const { return is_marked; }
-  void unmark() { is_marked = false; }
+  const std::string emu_path() const { return orig_path; }
+
+  const std::string real_path() const { return tmp_path; }
+
+  dev_t device() const { return device_; }
+  ino_t inode() const { return inode_; }
+
+  void ensure_size(uint64_t size);
+
+private:
+  friend class EmuFs;
+
+  EmuFile(EmuFs& owner, ScopedFd&& fd, const std::string& orig_path,
+          const std::string& real_path, dev_t device, ino_t inode,
+          uint64_t file_size);
+
+  /**
+   * Return a copy of this file.  See |create()| for the meaning
+   * of |fs_tag|.
+   */
+  shr_ptr clone(EmuFs& owner);
 
   /**
    * Ensure that the emulated file is sized to match a later
-   * stat() of it, |st|.
+   * stat() of it.
    */
-  void update(const struct stat& st);
+  void update(dev_t device, ino_t inode, uint64_t size);
 
   /**
    * Create a new emulated file for |orig_path| that will
@@ -102,45 +113,47 @@ public:
    * uniquely identify this file among multiple EmuFs's that
    * might exist concurrently in this tracer process.
    */
-  static shr_ptr create(const char* orig_path, const struct stat& est);
+  static shr_ptr create(EmuFs& owner, const std::string& orig_path,
+                        dev_t orig_device, ino_t orig_inode,
+                        uint64_t orig_file_size);
 
-private:
-  EmuFile(ScopedFd&& fd, const struct stat& est, const char* orig_path);
-
-  struct stat est;
   std::string orig_path;
+  std::string tmp_path;
   ScopedFd file;
-  bool is_marked;
+  EmuFs& owner;
+  uint64_t size_;
+  dev_t device_;
+  ino_t inode_;
 
   EmuFile(const EmuFile&) = delete;
   EmuFile operator=(const EmuFile&) = delete;
 };
 
 class EmuFs {
-  typedef std::map<FileId, EmuFile::shr_ptr> FileMap;
-
 public:
   typedef std::shared_ptr<EmuFs> shr_ptr;
 
   /**
-   * Return the EmuFile defined by |id|, which must exist or
-   * this won't return.
+   * Return the EmuFile for |recorded_map|, which must exist or this won't
+   * return.
    */
-  EmuFile::shr_ptr at(const FileId& id) const;
+  EmuFile::shr_ptr at(const KernelMapping& recorded_map) const;
+
+  bool has_file_for(const KernelMapping& recorded_map) const;
+
+  EmuFile::shr_ptr clone_file(EmuFile::shr_ptr emu_file);
 
   /**
-   * Return a copy of this fs such that |at()| and
-   * |get_or_create()| will return semantically identical
-   * results as this, and such that mutations of the returned fs
-   * won't affect this and vice versa.
+   * Return an emulated file representing the recorded shared mapping
+   * |recorded_km|.
    */
-  shr_ptr clone();
+  EmuFile::shr_ptr get_or_create(const KernelMapping& recorded_km);
 
   /**
-   * Return a real file path that refers to an emulated file
-   * representing the recorded file underlying |mf|.
+   * Return an already-existing emulated file for the given device/inode.
+   * Returns null if not found.
    */
-  EmuFile::shr_ptr get_or_create(const TraceMappedRegion& mf);
+  EmuFile::shr_ptr find(dev_t device, ino_t inode);
 
   /**
    * Dump information about this emufs to the "error" log.
@@ -152,43 +165,33 @@ public:
   /** Create and return a new emufs. */
   static shr_ptr create();
 
-  /**
-   * RAII helper that schedules an EmuFs GC when the exit of a given
-   * syscall may have dropped the last reference to an emulated file.
-   */
-  struct AutoGc {
-    AutoGc(ReplaySession& session, int syscallno,
-           SyscallEntryOrExit state = SYSCALL_EXIT);
-    ~AutoGc();
-
-  private:
-    ReplaySession& session;
-    const bool is_gc_point;
-  };
-
-  /**
-   * Collect emulated files that aren't referenced by tracees.
-   * Call this only when a tracee's (possibly shared) file table
-   * has been destroyed.  All other gc triggers are handled
-   * internally.
-   */
-  void gc(const Session& session);
+  void destroyed_file(EmuFile& emu_file) { files.erase(FileId(emu_file)); }
 
 private:
   EmuFs();
 
-  /**
-   * Mark all the files being used by the tasks in |as|, and
-   * increment |nt_marked_files| by the number of files that
-   * were marked.
-   */
-  void mark_used_vfiles(Task* t, const AddressSpace& as,
-                        size_t* nr_marked_files);
+  struct FileId {
+    FileId(const KernelMapping& recorded_map);
+    FileId(const EmuFile& emu_file)
+        : device(emu_file.device()), inode(emu_file.inode()) {}
+    FileId(dev_t device, ino_t inode)
+        : device(device), inode(inode) {}
+    bool operator<(const FileId& other) const {
+      return device < other.device ||
+             (device == other.device && inode < other.inode);
+    }
+    dev_t device;
+    ino_t inode;
+  };
+
+  typedef std::map<FileId, std::weak_ptr<EmuFile>> FileMap;
 
   FileMap files;
 
   EmuFs(const EmuFs&) = delete;
   EmuFs& operator=(const EmuFs&) = delete;
 };
+
+} // namespace rr
 
 #endif // RR_EMUFS_H

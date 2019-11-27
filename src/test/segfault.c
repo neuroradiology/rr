@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void sighandler(int sig) {
   atomic_printf("caught signal %d, exiting\n", sig);
@@ -12,7 +12,7 @@ static void breakpoint(void) {
   (void)break_here;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   signal(SIGSEGV, sighandler);
 
   breakpoint();

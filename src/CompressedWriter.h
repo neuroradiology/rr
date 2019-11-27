@@ -7,10 +7,12 @@
 #include <stdint.h>
 
 #include <memory>
-#include <vector>
 #include <string>
+#include <vector>
 
 #include "ScopedFd.h"
+
+namespace rr {
 
 /**
  * CompressedWriter opens an output file and writes compressed blocks to it.
@@ -36,19 +38,36 @@ public:
   bool good() const { return !error; }
   // Call only on producer thread.
   void write(const void* data, size_t size);
+  enum Sync { DONT_SYNC, SYNC };
   // Call only on producer thread
-  void close();
+  void close(Sync sync = DONT_SYNC);
 
   struct BlockHeader {
     uint32_t compressed_length;
     uint32_t uncompressed_length;
   };
 
+  template <typename T> CompressedWriter& operator<<(const T& value) {
+    write(&value, sizeof(value));
+    return *this;
+  }
+
+  CompressedWriter& operator<<(const std::string& value) {
+    write(value.c_str(), value.size() + 1);
+    return *this;
+  }
+
+  template <typename T>
+  CompressedWriter& operator<<(const std::vector<T>& value) {
+    *this << value.size();
+    for (auto& i : value) {
+      *this << i;
+    }
+    return *this;
+  }
+
 protected:
-  enum WaitFlag {
-    WAIT,
-    NOWAIT
-  };
+  enum WaitFlag { WAIT, NOWAIT };
   void update_reservation(WaitFlag wait_flag);
 
   static void* compression_thread_callback(void* p);
@@ -85,5 +104,7 @@ protected:
   uint64_t producer_reserved_upto_pos;
   bool error;
 };
+
+} // namespace rr
 
 #endif /* RR_COMPRESSED_WRITER_H_ */

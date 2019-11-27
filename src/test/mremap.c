@@ -1,8 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
-
-#define DUMMY_FILE "dummy.txt"
+#include "util.h"
 
 static void check_mapping(int* rpage, int* wpage, ssize_t nr_ints) {
   int i;
@@ -19,49 +17,53 @@ static void check_mapping(int* rpage, int* wpage, ssize_t nr_ints) {
 static void overwrite_file(const char* path, ssize_t num_bytes) {
   const int magic = 0x5a5a5a5a;
   int fd = open(path, O_TRUNC | O_RDWR, 0600);
-  int i;
+  test_assert(fd >= 0);
+  size_t i;
   for (i = 0; i < num_bytes / sizeof(magic); ++i) {
     write(fd, &magic, sizeof(magic));
   }
   close(fd);
 }
 
-int main(int argc, char* argv[]) {
+static const char file_name[] = "tmpfile";
+
+int main(void) {
   size_t num_bytes = sysconf(_SC_PAGESIZE);
-  int fd = open(DUMMY_FILE, O_CREAT | O_EXCL | O_RDWR, 0600);
+  int fd = open(file_name, O_CREAT | O_EXCL | O_RDWR, 0600);
   int* wpage;
   int* rpage;
   int* old_wpage;
 
   test_assert(fd >= 0);
 
-  overwrite_file(DUMMY_FILE, 2 * num_bytes);
+  overwrite_file(file_name, 2 * num_bytes);
 
   wpage = mmap(NULL, num_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   rpage = mmap(NULL, num_bytes, PROT_READ, MAP_SHARED, fd, 0);
   atomic_printf("wpage:%p rpage:%p\n", wpage, rpage);
   test_assert(wpage != (void*)-1 && rpage != (void*)-1 && rpage != wpage);
 
-  /* NB: this is a bad test in that it assumes
-   * ADDR_COMPAT_LAYOUT address-space allocation semantics.  If
-   * this test is run "normally", it will most likely fail this
-   * assertion.  To fix this we'd need to dyanmically determine
-   * which page is mapped just before the other and then remap
-   * that page. */
-  test_assert((uint8_t*)rpage - (uint8_t*)wpage == num_bytes);
-
   check_mapping(rpage, wpage, num_bytes / sizeof(*wpage));
 
-  overwrite_file(DUMMY_FILE, 2 * num_bytes);
+  overwrite_file(file_name, 2 * num_bytes);
 
   old_wpage = wpage;
-  wpage = mremap(old_wpage, num_bytes, 2 * num_bytes, MREMAP_MAYMOVE);
+
+  /* Test invalid mremap */
+  test_assert(MAP_FAILED ==
+              mremap(old_wpage, num_bytes, 2 * num_bytes - 1, 0xFFFFFFFF));
+  test_assert(EINVAL == errno);
+
+  /* Test remapping a non-page-sized range */
+  wpage = mremap(old_wpage, num_bytes, 2 * num_bytes - 1, MREMAP_MAYMOVE);
   atomic_printf("remapped wpage:%p\n", wpage);
-  test_assert(wpage != (void*)-1 && wpage != old_wpage);
+  test_assert(wpage != (void*)-1);
 
   check_mapping(rpage, wpage, num_bytes / sizeof(*wpage));
 
   atomic_puts("EXIT-SUCCESS");
+
+  unlink(file_name);
 
   return 0;
 }

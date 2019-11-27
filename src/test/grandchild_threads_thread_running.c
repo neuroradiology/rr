@@ -1,14 +1,14 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-static void* start_thread(void* p) {
+static void* start_thread(__attribute__((unused)) void* p) {
   while (1) {
   }
   return NULL;
 }
 
-int main(int argc, char** argv) {
+int main(void) {
   pid_t child;
   pthread_t thread;
   int pipe_fds[2];

@@ -1,9 +1,11 @@
-from rrutil import *
+from util import *
+import re
 
-send_gdb('c\n')
-expect_gdb('Program received signal SIGUSR1')
+send_gdb('c')
+index = expect_list([re.compile(r'exited normally'), re.compile(r'Program received signal SIGUSR1')])
 
-send_gdb('c\n')
-expect_gdb('exited normally')
+if index == 1:
+    send_gdb('c')
+    expect_gdb('exited normally')
 
 ok()

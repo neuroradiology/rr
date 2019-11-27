@@ -5,29 +5,33 @@
 
 #include "TraceStream.h"
 
-class Task;
+namespace rr {
+
+class ReplayTask;
 struct ReplayTraceStep;
 
 /**
- * Call this when |t| has just entered a syscall.  At this point, data
- * saved at |rec_before_record_syscall_entry()| can be restored.
+ * Prepare for a pending syscall. Call this when |t| is going to run towards
+ * a syscall.
  */
-void rep_after_enter_syscall(Task* t, int syscallno);
-
-/* Process pending syscall. Call this when |t| is about to enter or exit
- * a syscall. */
-void rep_process_syscall(Task* t, ReplayTraceStep* step);
+void rep_prepare_run_to_syscall(ReplayTask* t, ReplayTraceStep* step);
 
 /**
- * |t| is at a "write" syscall.  If the recorded write was to STDOUT
- * or STDERR, then also write the output to the current STDOUT/STDERR
- * (if the user wishes).
- *
- * NB: this doesn't bother to check for writes to the actual
- * STDOUT/STDERR /files/, just the fd numbers.  We don't record file
- * information.  That means output written to a dup of STDOUT will not
- * be replayed by this helper.  This could maybe be a todo.
+ * Call this when |t| has just entered a syscall.
  */
-void rep_maybe_replay_stdio_write(Task* t);
+void rep_after_enter_syscall(ReplayTask* t);
+
+/**
+ * Process pending syscall. Call this when |t| is about to exit a syscall.
+ */
+void rep_process_syscall(ReplayTask* t, ReplayTraceStep* step);
+
+/**
+ * Process an EV_GROW_MAP event. These are like mmap syscalls, so handled
+ * in replay_syscall.
+ */
+void process_grow_map(ReplayTask* t);
+
+} // namespace rr
 
 #endif /* RR_REP_PROCESS_EVENT_H_ */

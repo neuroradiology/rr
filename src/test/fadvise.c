@@ -1,8 +1,8 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   /* There's not a (simple) way to meaningfully test fadvise,
    * since it only provides optimization hints, so this just
    * checks that rr doesn't blow up when it sees one. */

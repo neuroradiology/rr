@@ -1,8 +1,8 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-#define NUM_ITERATIONS (1 << 30)
+#define NUM_ITERATIONS 1000000000
 
 static void breakpoint(void) {
   int break_here = 1;
@@ -26,8 +26,7 @@ int spin(void) {
   return dummy;
 }
 
-int main(int argc, char* argv[]) {
-
+int main(void) {
   atomic_printf("EXIT-SUCCESS dummy=%d\n", spin());
   return 0;
 }

@@ -1,8 +1,8 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   gid_t groups[1024];
   int num_groups = getgroups(ALEN(groups), groups);
   int i;

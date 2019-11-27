@@ -1,24 +1,336 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define DEBUGTAG "ReplaySession"
 #define USE_BREAKPOINT_TARGET 1
-#define USE_TIMESLICE_COALESCING 1
 
 #include "ReplaySession.h"
 
-#include <syscall.h>
+#include <linux/futex.h>
 #include <sys/prctl.h>
+#include <syscall.h>
 
 #include <algorithm>
 
 #include "AutoRemoteSyscalls.h"
+#include "Flags.h"
+#include "ReplayTask.h"
+#include "ThreadGroup.h"
+#include "core.h"
+#include "fast_forward.h"
+#include "kernel_abi.h"
+#include "kernel_metadata.h"
 #include "log.h"
 #include "replay_syscall.h"
-#include "task.h"
 #include "util.h"
 
-using namespace rr;
 using namespace std;
+
+namespace rr {
+
+static void debug_memory(ReplayTask* t) {
+  FrameTime current_time = t->current_frame_time();
+  if (should_dump_memory(t->current_trace_frame().event(), current_time)) {
+    dump_process_memory(t, current_time, "rep");
+  }
+  if (t->session().done_initial_exec() &&
+      should_checksum(t->current_trace_frame().event(), current_time)) {
+    /* Validate the checksum we computed during the
+     * recording phase. */
+    validate_process_memory(t, current_time);
+  }
+}
+
+static void split_at_address(ReplaySession::MemoryRanges& ranges,
+                             remote_ptr<void> addr) {
+  ReplaySession::MemoryRanges::iterator it =
+      ranges.lower_bound(MemoryRange(addr, addr + 1));
+  if (it != ranges.end() && it->contains(addr) && it->start() != addr) {
+    MemoryRange r1(it->start(), addr);
+    MemoryRange r2(addr, it->end());
+    ranges.erase(it);
+    ranges.insert(r1);
+    ranges.insert(r2);
+  }
+}
+
+static void delete_range(ReplaySession::MemoryRanges& ranges,
+                         const MemoryRange& r) {
+  split_at_address(ranges, r.start());
+  split_at_address(ranges, r.end());
+  auto first = ranges.lower_bound(MemoryRange(r.start(), r.start() + 1));
+  auto last = ranges.lower_bound(MemoryRange(r.end(), r.end() + 1));
+  ranges.erase(first, last);
+}
+
+ReplaySession::MemoryRanges ReplaySession::always_free_address_space(
+    const TraceReader& reader) {
+  MemoryRanges result;
+  remote_ptr<void> addressable_min = remote_ptr<void>(64 * 1024);
+  // Assume 64-bit address spaces with the 47-bit user-space limitation,
+  // for now.
+  remote_ptr<void> addressable_max = uintptr_t(
+      sizeof(void*) == 8 ? uint64_t(1) << 47 : (uint64_t(1) << 32) - PAGE_SIZE);
+  result.insert(MemoryRange(addressable_min, addressable_max));
+  TraceReader tmp_reader(reader);
+  bool found;
+  while (true) {
+    KernelMapping km = tmp_reader.read_mapped_region(
+        nullptr, &found, TraceReader::DONT_VALIDATE, TraceReader::ANY_TIME);
+    if (!found) {
+      break;
+    }
+    delete_range(result, km);
+  }
+  delete_range(result, MemoryRange(AddressSpace::rr_page_start(),
+                                   AddressSpace::rr_page_end()));
+  return result;
+}
+
+static bool tracee_xsave_enabled(const TraceReader& trace_in) {
+  const CPUIDRecord* record =
+    find_cpuid_record(trace_in.cpuid_records(), CPUID_GETFEATURES, 0);
+  return (record->out.ecx & OSXSAVE_FEATURE_FLAG) != 0;
+}
+
+static void check_xsave_compatibility(const TraceReader& trace_in) {
+  if (!tracee_xsave_enabled(trace_in)) {
+    // Tracee couldn't use XSAVE so everything should be fine.
+    // If it didn't detect absence of XSAVE and actually executed an XSAVE
+    // and got a fault then replay will probably diverge :-(
+    return;
+  }
+  if (!xsave_enabled()) {
+    // Replaying on a super old CPU that doesn't even support XSAVE!
+    if (!Flags::get().suppress_environment_warnings) {
+      fprintf(stderr, "rr: Tracees had XSAVE but XSAVE is not available "
+              "now; Replay will probably fail because glibc dynamic loader "
+              "uses XSAVE\n\n");
+    }
+    return;
+  }
+
+  uint64_t tracee_xcr0 = trace_in.xcr0();
+  uint64_t our_xcr0 = xcr0();
+  const CPUIDRecord* record =
+    find_cpuid_record(trace_in.cpuid_records(), CPUID_GETXSAVE, 1);
+  bool tracee_xsavec = record && (record->out.eax & XSAVEC_FEATURE_FLAG);
+  CPUIDData data = cpuid(CPUID_GETXSAVE, 1);
+  bool our_xsavec = (data.eax & XSAVEC_FEATURE_FLAG) != 0;
+  if (tracee_xsavec && !our_xsavec &&
+      !Flags::get().suppress_environment_warnings) {
+    fprintf(stderr, "rr: Tracees had XSAVEC but XSAVEC is not available "
+            "now; Replay will probably fail because glibc dynamic loader "
+            "uses XSAVEC\n\n");
+  }
+
+  if (tracee_xcr0 != our_xcr0) {
+    if (!Flags::get().suppress_environment_warnings) {
+      // If the tracee used XSAVE instructions which write different components
+      // to XSAVE instructions executed on our CPU, or examines XCR0 directly,
+      // This will cause divergence. The dynamic linker examines XCR0 so this
+      // is nearly guaranteed.
+      cerr << "Trace XCR0 value " << HEX(tracee_xcr0) << " != our XCR0 "
+          << "value " << HEX(our_xcr0) << "; Replay will probably fail "
+          << "because glibc dynamic loader examines XCR0\n\n";
+    }
+  }
+
+  bool check_alignment = tracee_xsavec && our_xsavec;
+  // Check that sizes and offsets of supported XSAVE areas area all identical.
+  // An Intel employee promised this on a mailing list...
+  // https://lists.xen.org/archives/html/xen-devel/2013-09/msg00484.html
+  for (int feature = 2; feature <= 63; ++feature) {
+    if (!(tracee_xcr0 & our_xcr0 & (uint64_t(1) << feature))) {
+      continue;
+    }
+    record =
+      find_cpuid_record(trace_in.cpuid_records(), CPUID_GETXSAVE, feature);
+    CPUIDData data = cpuid(CPUID_GETXSAVE, feature);
+    if (!record || record->out.eax != data.eax ||
+        record->out.ebx != data.ebx ||
+        (check_alignment && (record->out.ecx & 2) != (data.ecx & 2))) {
+      CLEAN_FATAL()
+          << "XSAVE offset/size/alignment differs for feature " << feature
+          << "; H. Peter Anvin said this would never happen!";
+    }
+  }
+}
+
+ReplaySession::ReplaySession(const std::string& dir, const Flags& flags)
+    : emu_fs(EmuFs::create()),
+      trace_in(dir),
+      trace_frame(),
+      current_step(),
+      ticks_at_start_of_event(0),
+      flags_(flags),
+      trace_start_time(0) {
+  ticks_semantics_ = trace_in.ticks_semantics();
+
+  memset(&last_siginfo_, 0, sizeof(last_siginfo_));
+  advance_to_next_trace_frame();
+
+  trace_start_time = trace_frame.monotonic_time();
+
+  if (trace_in.uses_cpuid_faulting() && !has_cpuid_faulting()) {
+    CLEAN_FATAL()
+        << "Trace was recorded with CPUID faulting enabled, but this\n"
+           "system does not support CPUID faulting.";
+  }
+  if (!has_cpuid_faulting() && !cpuid_compatible(trace_in.cpuid_records())) {
+    CLEAN_FATAL()
+        << "Trace was recorded on a machine with different CPUID values\n"
+           "and CPUID faulting is not enabled; replay will not work.";
+  }
+  if (!PerfCounters::supports_ticks_semantics(ticks_semantics_)) {
+    CLEAN_FATAL()
+        << "Trace was recorded on a machine that defines ticks differently\n"
+           "to this machine; replay will not work.";
+  }
+
+  check_xsave_compatibility(trace_in);
+}
+
+ReplaySession::ReplaySession(const ReplaySession& other)
+    : Session(other),
+      emu_fs(EmuFs::create()),
+      trace_in(other.trace_in),
+      trace_frame(other.trace_frame),
+      current_step(other.current_step),
+      ticks_at_start_of_event(other.ticks_at_start_of_event),
+      cpuid_bug_detector(other.cpuid_bug_detector),
+      last_siginfo_(other.last_siginfo_),
+      flags_(other.flags_),
+      trace_start_time(other.trace_start_time) {}
+
+ReplaySession::~ReplaySession() {
+  // We won't permanently leak any OS resources by not ensuring
+  // we've cleaned up here, but sessions can be created and
+  // destroyed many times, and we don't want to temporarily hog
+  // resources.
+  kill_all_tasks();
+  syscall_bp_vm = nullptr;
+  DEBUG_ASSERT(task_map.empty() && vm_map.empty());
+  DEBUG_ASSERT(emufs().size() == 0);
+}
+
+ReplaySession::shr_ptr ReplaySession::clone() {
+  LOG(debug) << "Deepforking ReplaySession " << this << " ...";
+
+  finish_initializing();
+  clear_syscall_bp();
+
+  shr_ptr session(new ReplaySession(*this));
+  LOG(debug) << "  deepfork session is " << session.get();
+
+  copy_state_to(*session, emufs(), session->emufs());
+
+  return session;
+}
+
+/**
+ * Return true if it's possible/meaningful to make a checkpoint at the
+ * |frame| that |t| will replay.
+ */
+static bool can_checkpoint_at(const TraceFrame& frame) {
+  const Event& ev = frame.event();
+  if (ev.has_ticks_slop()) {
+    return false;
+  }
+  switch (ev.type()) {
+    case EV_EXIT:
+    // At exits, we can't clone the exiting tasks, so
+    // don't event bother trying to checkpoint.
+    case EV_SYSCALLBUF_RESET:
+    // RESETs are usually inserted in between syscall
+    // entry/exit.  Do not attempting to checkpoint at
+    // RESETs.  Users would never want to do that anyway.
+    case EV_TRACE_TERMINATION:
+      // There's nothing to checkpoint at the end of a trace.
+      return false;
+    default:
+      return true;
+  }
+}
+
+bool ReplaySession::can_clone() {
+  finish_initializing();
+
+  ReplayTask* t = current_task();
+  return t && done_initial_exec() && can_checkpoint_at(current_trace_frame());
+}
+
+DiversionSession::shr_ptr ReplaySession::clone_diversion() {
+  finish_initializing();
+  clear_syscall_bp();
+
+  LOG(debug) << "Deepforking ReplaySession " << this
+             << " to DiversionSession...";
+
+  DiversionSession::shr_ptr session(new DiversionSession());
+  session->ticks_semantics_ = ticks_semantics_;
+  session->tracee_socket = tracee_socket;
+  session->tracee_socket_fd_number = tracee_socket_fd_number;
+  LOG(debug) << "  deepfork session is " << session.get();
+
+  copy_state_to(*session, emufs(), session->emufs());
+  session->finish_initializing();
+
+  return session;
+}
+
+Task* ReplaySession::new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
+                              SupportedArch a) {
+  return new ReplayTask(*this, tid, rec_tid, serial, a);
+}
+
+/*static*/ ReplaySession::shr_ptr ReplaySession::create(const string& dir,
+                                                        const ReplaySession::Flags& flags) {
+  shr_ptr session(new ReplaySession(dir, flags));
+
+  // It doesn't really matter what we use for argv/env here, since
+  // replay_syscall's process_execve is going to follow the recording and
+  // ignore the parameters.
+  string exe_path;
+  vector<string> argv;
+  vector<string> env;
+
+  ScopedFd error_fd = session->create_spawn_task_error_pipe();
+  ReplayTask* t = static_cast<ReplayTask*>(
+      Task::spawn(*session, error_fd, &session->tracee_socket_fd(),
+                  &session->tracee_socket_fd_number,
+                  session->trace_in, exe_path, argv, env,
+                  session->trace_reader().peek_frame().tid()));
+  session->on_create(t);
+
+  return session;
+}
+
+int ReplaySession::cpu_binding(TraceStream& trace) const {
+  if (flags_.cpu_unbound) {
+    return -1;
+  }
+  return Session::cpu_binding(trace);
+}
+
+void ReplaySession::advance_to_next_trace_frame() {
+  if (trace_in.at_end()) {
+    trace_frame = TraceFrame(trace_frame.time(), 0, Event::trace_termination(),
+                             trace_frame.ticks(), trace_frame.monotonic_time());
+    return;
+  }
+
+  trace_frame = trace_in.read_frame();
+}
+
+bool ReplaySession::is_ignored_signal(int sig) {
+  switch (sig) {
+    // TIME_SLICE_SIGNALs can be queued but not delivered before we stop
+    // execution for some other reason. Ignore them.
+    case PerfCounters::TIME_SLICE_SIGNAL:
+      return true;
+    default:
+      return false;
+  }
+}
 
 /* Why a skid region?  Interrupts generated by perf counters don't
  * fire at exactly the programmed point (as of 2013 kernel/HW);
@@ -55,253 +367,61 @@ using namespace std;
  * perhaps pipeline depth and things of that nature are involved.  But
  * those reasons if they exit are currently not understood.
  */
-static const int SKID_SIZE = 70;
-
-static void debug_memory(Task* t) {
-  if (should_dump_memory(t, t->current_trace_frame())) {
-    dump_process_memory(t, t->current_trace_frame().time(), "rep");
-  }
-  if (t->session().can_validate() &&
-      should_checksum(t, t->current_trace_frame())) {
-    /* Validate the checksum we computed during the
-     * recording phase. */
-    validate_process_memory(t, t->current_trace_frame().time());
-  }
-}
-
-static void remap_shared_mmap(AutoRemoteSyscalls& remote, EmuFs& dest_emu_fs,
-                              const Mapping& m, const MappableResource& r) {
-  LOG(debug) << "    remapping shared region at " << m.start << "-" << m.end;
-  remote.syscall(syscall_number_for_munmap(remote.arch()), m.start,
-                 m.num_bytes());
-  // NB: we don't have to unmap then re-map |t->vm()|'s idea of
-  // the emulated file mapping.  Though we'll be remapping the
-  // *real* OS mapping in |t| to a different file, that new
-  // mapping still refers to the same *emulated* file, with the
-  // same emulated metadata.
-
-  auto emufile = dest_emu_fs.at(r.id);
-  // TODO: this duplicates some code in replay_syscall.cc, but
-  // it's somewhat nontrivial to factor that code out.
-  int remote_fd;
-  {
-    string path = emufile->proc_path();
-    AutoRestoreMem child_path(remote, path.c_str());
-    int oflags =
-        (MAP_SHARED & m.flags) && (PROT_WRITE & m.prot) ? O_RDWR : O_RDONLY;
-    remote_fd = remote.syscall(syscall_number_for_open(remote.arch()),
-                               child_path.get().as_int(), oflags);
-    if (0 > remote_fd) {
-      FATAL() << "Couldn't open " << path << " in tracee";
+static bool compute_ticks_request(
+    ReplayTask* t, const ReplaySession::StepConstraints& constraints,
+    TicksRequest* ticks_request) {
+  *ticks_request = RESUME_UNLIMITED_TICKS;
+  if (constraints.ticks_target > 0) {
+    Ticks ticks_period =
+        constraints.ticks_target - PerfCounters::skid_size() - t->tick_count();
+    if (ticks_period <= 0) {
+      // Behave as if we actually executed something. Callers assume we did.
+      t->clear_wait_status();
+      return false;
+    }
+    if (ticks_period > MAX_TICKS_REQUEST) {
+      // Avoid overflow. The execution will stop early but we'll treat that
+      // just like a stray TIME_SLICE_SIGNAL and continue as needed.
+      *ticks_request = MAX_TICKS_REQUEST;
+    } else {
+      *ticks_request = (TicksRequest)ticks_period;
     }
   }
-  // XXX this condition is x86/x64-specific, I imagine.
-  bool page_offset_mmap_in_use = has_mmap2_syscall(remote.arch());
-  remote_ptr<void> addr = remote.syscall(
-      page_offset_mmap_in_use ? syscall_number_for_mmap2(remote.arch())
-                              : syscall_number_for_mmap(remote.arch()),
-      m.start, m.num_bytes(), m.prot,
-      // The remapped segment *must* be
-      // remapped at the same address,
-      // or else many things will go
-      // haywire.
-      m.flags | MAP_FIXED, remote_fd,
-      page_offset_mmap_in_use ? m.offset / page_size() : m.offset);
-  ASSERT(remote.task(), addr == m.start);
-
-  remote.syscall(syscall_number_for_close(remote.arch()), remote_fd);
+  return true;
 }
 
-ReplaySession::~ReplaySession() {
-  // We won't permanently leak any OS resources by not ensuring
-  // we've cleaned up here, but sessions can be created and
-  // destroyed many times, and we don't want to temporarily hog
-  // resources.
-  kill_all_tasks();
-  assert(tasks().size() == 0 && vms().size() == 0);
-  gc_emufs();
-  assert(emufs().size() == 0);
+static void perform_interrupted_syscall(ReplayTask* t) {
+  t->finish_emulated_syscall();
+  AutoRemoteSyscalls remote(t);
+  const Registers& r = t->regs();
+  long ret = remote.syscall(r.original_syscallno(), r.arg1(), r.arg2(),
+                            r.arg3(), r.arg4(), r.arg5(), r.arg6());
+  remote.regs().set_syscall_result(ret);
 }
 
-void ReplaySession::copy_state_to(Session& dest, EmuFs& dest_emu_fs) {
-  for (auto vm : sas) {
-    // Creating a checkpoint of a session with active breakpoints
-    // or watchpoints is not supported.
-    assert(!vm->has_breakpoints());
-    assert(!vm->has_watchpoints());
-
-    Task* some_task = *vm->task_set().begin();
-    pid_t tgid = some_task->tgid();
-    Task* group_leader = find_task(tgid);
-    LOG(debug) << "  forking tg " << tgid
-               << " (real: " << group_leader->real_tgid() << ")";
-
-    if (group_leader->is_probably_replaying_syscall()) {
-      group_leader->finish_emulated_syscall();
-    }
-
-    Task* clone_leader = group_leader->os_fork_into(&dest);
-    dest.on_create(clone_leader);
-    LOG(debug) << "  forked new group leader " << clone_leader->tid;
-
-    {
-      AutoRemoteSyscalls remote(clone_leader);
-      for (auto& kv : clone_leader->vm()->memmap()) {
-        const Mapping& m = kv.first;
-        const MappableResource& r = kv.second;
-        if (!r.is_shared_mmap_file()) {
-          continue;
-        }
-        remap_shared_mmap(remote, dest_emu_fs, m, r);
-      }
-
-      for (auto t : group_leader->task_group()->task_set()) {
-        if (group_leader == t) {
-          continue;
-        }
-        LOG(debug) << "    cloning " << t->rec_tid;
-
-        if (t->is_probably_replaying_syscall()) {
-          t->finish_emulated_syscall();
-        }
-        Task* t_clone = t->os_clone_into(clone_leader, remote);
-        dest.on_create(t_clone);
-        t_clone->copy_state(t);
-      }
-    }
-    LOG(debug) << "  restoring group-leader state ...";
-    clone_leader->copy_state(group_leader);
+bool ReplaySession::handle_unrecorded_cpuid_fault(
+    ReplayTask* t, const StepConstraints& constraints) {
+  if (t->stop_sig() != SIGSEGV || !has_cpuid_faulting() ||
+      trace_in.uses_cpuid_faulting() ||
+      trapped_instruction_at(t, t->ip()) != TrappedInstruction::CPUID) {
+    return false;
   }
-  assert(dest.vms().size() > 0);
-}
+  // OK, this is a case where we did not record using CPUID faulting but we are
+  // replaying with CPUID faulting and the tracee just executed a CPUID.
+  // We try to find the results in the "all CPUID leaves" we saved.
 
-ReplaySession::shr_ptr ReplaySession::clone() {
-  LOG(debug) << "Deepforking ReplaySession " << this << " ...";
-
-  shr_ptr session(new ReplaySession(*this));
-  LOG(debug) << "  deepfork session is " << session.get();
-  session->tracees_consistent = tracees_consistent;
-  memcpy(session->syscallbuf_flush_buffer_array, syscallbuf_flush_buffer_array,
-         sizeof(syscallbuf_flush_buffer_array));
-
-  copy_state_to(*session, session->emufs());
-
-  return session;
-}
-
-DiversionSession::shr_ptr ReplaySession::clone_diversion() {
-  LOG(debug) << "Deepforking ReplaySession " << this
-             << " to DiversionSession...";
-
-  DiversionSession::shr_ptr session(new DiversionSession(*this));
-  LOG(debug) << "  deepfork session is " << session.get();
-
-  copy_state_to(*session, session->emufs());
-
-  return session;
-}
-
-void ReplaySession::gc_emufs() { emu_fs->gc(*this); }
-
-/*static*/ ReplaySession::shr_ptr ReplaySession::create(int argc,
-                                                        char* argv[]) {
-  shr_ptr session(new ReplaySession(argc > 0 ? argv[0] : ""));
-
-  // Because we execvpe() the tracee, we must ensure that $PATH
-  // is the same as in recording so that libc searches paths in
-  // the same order.  So copy that over now.
-  //
-  // And because we use execvpe(), the exec'd tracee will start
-  // with a fresh environment guaranteed to be the same as in
-  // replay, so we don't have to worry about any mutation here
-  // affecting post-exec execution.
-  for (auto& e : session->trace_in.initial_envp()) {
-    if (e.find("PATH=") == 0) {
-      // NB: intentionally leaking this string.
-      putenv(strdup(e.c_str()));
-    }
-  }
-
-  Task* t = Task::spawn(*session, session->trace_in,
-                        session->trace_reader().peek_frame().tid());
-  session->on_create(t);
-
-  return session;
-}
-
-void ReplaySession::advance_to_next_trace_frame() {
-  if (last_task()) {
-    // Already finished replay; no need to advance (and in fact, we can't).
-    return;
-  }
-
-  trace_frame = trace_in.read_frame();
-
-  // Subsequent reschedule-events of the same thread can be
-  // combined to a single event.  This meliorization is a
-  // tremendous win.
-  if (USE_TIMESLICE_COALESCING && trace_frame.event().type == EV_SCHED) {
-    TraceFrame next_frame = trace_in.peek_frame();
-    while (EV_SCHED == next_frame.event().type &&
-           next_frame.tid() == trace_frame.tid() &&
-           Flags::get().goto_event != next_frame.time() &&
-           !trace_instructions_up_to_event(next_frame.time())) {
-      trace_frame = trace_in.read_frame();
-      next_frame = trace_in.peek_frame();
-    }
-  }
-}
-
-/**
- * Compares the register file as it appeared in the recording phase
- * with the current register file.
- * If syscallno is 0, this is a signal delivery, not a syscall.
- */
-static void validate_args(int syscallno, SyscallEntryOrExit state, Task* t) {
-  Registers rec_regs = t->current_trace_frame().regs();
-
-  /* don't validate anything before execve is done as the actual
-   * process did not start prior to this point */
-  if (!t->session().can_validate()) {
-    return;
-  }
-  if (rec_regs.arch() == SupportedArch::x86 &&
-      (X86Arch::pwrite64 == syscallno || X86Arch::pread64 == syscallno) &&
-      SYSCALL_EXIT == state) {
-    /* The x86 linux 3.5.0-36 kernel packaged with Ubuntu
-     * 12.04 has been observed to mutate $esi across
-     * syscall entry/exit.  (This has been verified
-     * outside of rr as well; not an rr bug.)  It's not
-     * clear whether this is a ptrace bug or a kernel bug,
-     * but either way it's not supposed to happen.  So we
-     * fudge registers here to cover up that bug. */
-    if (t->regs().arg4() != rec_regs.arg4()) {
-      LOG(warn) << "Probably saw kernel bug mutating $esi across pread/write64 "
-                   "call: recorded:" << HEX(rec_regs.arg4())
-                << "; replaying:" << t->regs().arg4()
-                << ".  Fudging registers.";
-      rec_regs.set_arg4(t->regs().arg4());
-    }
-  }
-  assert_child_regs_are(t, rec_regs);
-}
-
-/** Return true when |t|'s $ip points at a syscall instruction. */
-static bool entering_syscall_insn(Task* t) {
-  static const uint8_t sysenter[] = { 0x0f, 0x34 };
-#if defined(__x86_64__)
-  static const uint8_t syscall_insn[] = { 0x0f, 0x05 };
-#elif defined(__i386__)
-  static const uint8_t syscall_insn[] = { 0xcd, 0x80 };
-#else
-#error unknown architecture
-#endif
-  static_assert(sizeof(sysenter) == sizeof(syscall_insn), "Must ==");
-  uint8_t insn[sizeof(sysenter)];
-
-  t->read_bytes(t->ip(), insn);
-  return (!memcmp(insn, sysenter, sizeof(sysenter)) ||
-          !memcmp(insn, syscall_insn, sizeof(syscall_insn)));
+  const vector<CPUIDRecord>& records = trace_in.cpuid_records();
+  Registers r = t->regs();
+  const CPUIDRecord* rec = find_cpuid_record(records, r.ax(), r.cx());
+  ASSERT(t, rec) << "Can't find CPUID record for request AX=" << HEX(r.ax())
+                 << " CX=" << HEX(r.cx());
+  r.set_cpuid_output(rec->out.eax, rec->out.ebx, rec->out.ecx, rec->out.edx);
+  r.set_ip(r.ip() + trapped_instruction_len(TrappedInstruction::CPUID));
+  t->set_regs(r);
+  // Clear SIGSEGV status since we're handling it
+  t->set_status(constraints.is_singlestep() ? WaitStatus::for_stop_sig(SIGTRAP)
+                                            : WaitStatus());
+  return true;
 }
 
 /**
@@ -310,59 +430,79 @@ static bool entering_syscall_insn(Task* t) {
  * we're emulating the syscall.  Return COMPLETE when the next syscall
  * boundary is reached, or INCOMPLETE if advancing to the boundary was
  * interrupted by an unknown trap.
+ * When |syscall_trace_frame| is non-null, we continue to the syscall by
+ * setting a breakpoint instead of running until we execute a system
+ * call instruction. In that case we will not actually enter the kernel.
  */
-Completion ReplaySession::cont_syscall_boundary(Task* t, ExecOrEmulate emu,
-                                                RunCommand stepi) {
-  bool is_syscall_entry = SYSCALL_ENTRY == trace_frame.event().state;
-  if (is_syscall_entry) {
-    t->stepped_into_syscall = false;
-  }
-
-  ResumeRequest resume_how;
-  if (emu == EMULATE && stepi == RUN_SINGLESTEP) {
-    resume_how = RESUME_SYSEMU_SINGLESTEP;
-  } else if (emu == EMULATE) {
-    resume_how = RESUME_SYSEMU;
-  } else if (stepi == RUN_SINGLESTEP) {
-    resume_how = RESUME_SINGLESTEP;
-    // Annoyingly, PTRACE_SINGLESTEP doesn't raise
-    // PTRACE_O_SYSGOOD traps.  (Unlike
-    // PTRACE_SINGLESTEP_SYSEMU, which does.)  That means
-    // if we just blindly stepi'd the tracee to a
-    // non-emulated syscall, we'd shoot right past it
-    // without knowing.
-    //
-    // The correct solution to this problem is to emulate
-    // all syscalls during replay and then inject the
-    // executed ones (as we do for mmap).  But for now,
-    // work around this problem by recognizing syscall
-    // insns and issuing PTRACE_SYSCALL to enter them
-    // instead of PTRACE_SINGLESTEP.
-    if (entering_syscall_insn(t) || t->stepped_into_syscall) {
-      resume_how = RESUME_SYSCALL;
-      // Leave this breadcrumb on syscall entry so
-      // that we know to issue PTRACE_SYSCALL to
-      // exit the syscall the next time we stepi.
-      t->stepped_into_syscall = is_syscall_entry;
-    }
-  } else {
-    resume_how = RESUME_SYSCALL;
-  }
-  t->resume_execution(resume_how, RESUME_WAIT);
-
-  t->child_sig = t->pending_sig();
-  if (is_ignored_replay_signal(t->child_sig)) {
-    return cont_syscall_boundary(t, emu, stepi);
-  }
-  if (SIGTRAP == t->child_sig) {
+Completion ReplaySession::cont_syscall_boundary(
+    ReplayTask* t, const StepConstraints& constraints) {
+  TicksRequest ticks_request;
+  if (!compute_ticks_request(t, constraints, &ticks_request)) {
     return INCOMPLETE;
-  } else if (t->child_sig) {
-    ASSERT(t, false) << "Replay got unrecorded signal " << t->child_sig;
   }
 
-  assert(t->child_sig == 0);
+  if (constraints.command == RUN_SINGLESTEP_FAST_FORWARD) {
+    // ignore ticks_period. We can't add more than one tick during a
+    // fast_forward so it doesn't matter.
+    did_fast_forward |= fast_forward_through_instruction(
+        t, RESUME_SYSEMU_SINGLESTEP, constraints.stop_before_states);
+  } else {
+    ResumeRequest resume_how =
+        constraints.is_singlestep() ? RESUME_SYSEMU_SINGLESTEP : RESUME_SYSEMU;
+    t->resume_execution(resume_how, RESUME_WAIT, ticks_request);
+  }
+
+  switch (t->stop_sig()) {
+    case 0:
+      break;
+    case PerfCounters::TIME_SLICE_SIGNAL:
+      // This would normally be triggered by constraints.ticks_target but it's
+      // also possible to get stray signals here.
+      return INCOMPLETE;
+    case SIGSEGV:
+      if (handle_unrecorded_cpuid_fault(t, constraints)) {
+        return INCOMPLETE;
+      }
+      break;
+    case SIGTRAP:
+      return INCOMPLETE;
+    default:
+      break;
+  }
+  if (t->stop_sig()) {
+      ASSERT(t, false) << "Replay got unrecorded signal " << t->get_siginfo();
+  }
+
+  if (t->seccomp_bpf_enabled &&
+      syscall_seccomp_ordering_ == PTRACE_SYSCALL_BEFORE_SECCOMP_UNKNOWN) {
+    ASSERT(t, !constraints.is_singlestep());
+    if (t->ptrace_event() == PTRACE_EVENT_SECCOMP) {
+      syscall_seccomp_ordering_ = SECCOMP_BEFORE_PTRACE_SYSCALL;
+    } else {
+      syscall_seccomp_ordering_ = PTRACE_SYSCALL_BEFORE_SECCOMP;
+    }
+    // Eat the following event, either a seccomp or syscall notification
+    t->resume_execution(RESUME_SYSEMU, RESUME_WAIT, ticks_request);
+  }
+
+  auto type = AddressSpace::rr_page_syscall_from_exit_point(t->ip());
+  if (type && type->traced == AddressSpace::UNTRACED &&
+      type->enabled == AddressSpace::REPLAY_ONLY) {
+    // Actually perform it. We can hit these when replaying through syscallbuf
+    // code that was interrupted.
+    perform_interrupted_syscall(t);
+    return INCOMPLETE;
+  }
 
   return COMPLETE;
+}
+
+void ReplaySession::clear_syscall_bp() {
+  if (syscall_bp_vm) {
+    syscall_bp_vm->remove_breakpoint(syscall_bp_addr, BKPT_INTERNAL);
+    syscall_bp_vm = nullptr;
+    syscall_bp_addr = nullptr;
+  }
 }
 
 /**
@@ -370,11 +510,73 @@ Completion ReplaySession::cont_syscall_boundary(Task* t, ExecOrEmulate emu,
  * |step|.  Return COMPLETE if successful, or INCOMPLETE if an unhandled trap
  * occurred.
  */
-Completion ReplaySession::enter_syscall(Task* t, RunCommand stepi) {
-  if (cont_syscall_boundary(t, current_step.syscall.emu, stepi) == INCOMPLETE) {
-    return INCOMPLETE;
+Completion ReplaySession::enter_syscall(ReplayTask* t,
+                                        const StepConstraints& constraints) {
+  if (t->regs().matches(trace_frame.regs()) &&
+      t->tick_count() == trace_frame.ticks()) {
+    // We already entered the syscall via an ENTERING_SYSCALL_PTRACE
+    ASSERT(t,
+           current_trace_frame().event().Syscall().state == ENTERING_SYSCALL);
+  } else {
+    remote_code_ptr syscall_instruction;
+
+    if (done_initial_exec()) {
+      syscall_instruction =
+          current_trace_frame().regs().ip().decrement_by_syscall_insn_length(
+              t->arch());
+      // If the breakpoint already exists, it must have been from a previous
+      // invocation of this function for the same event (once the event
+      // completes, the breakpoint is cleared).
+      DEBUG_ASSERT(!syscall_bp_vm || (syscall_bp_vm == t->vm() &&
+                                      syscall_instruction == syscall_bp_addr &&
+                                      t->vm()->get_breakpoint_type_at_addr(
+                                          syscall_instruction) != BKPT_NONE));
+      // Skip this optimization if we can't set the breakpoint, or if it's
+      // in writeable or shared memory, since in those cases it could be
+      // overwritten by the tracee. It could even be dynamically generated and
+      // not generated yet.
+      if (!syscall_bp_vm &&
+          t->vm()->is_breakpoint_in_private_read_only_memory(
+              syscall_instruction) &&
+          t->vm()->add_breakpoint(syscall_instruction, BKPT_INTERNAL)) {
+        syscall_bp_vm = t->vm();
+        syscall_bp_addr = syscall_instruction;
+      }
+    }
+
+    if (cont_syscall_boundary(t, constraints) == INCOMPLETE) {
+      bool reached_target = syscall_bp_vm && SIGTRAP == t->stop_sig() &&
+                            t->ip().decrement_by_bkpt_insn_length(t->arch()) ==
+                                syscall_instruction &&
+                            t->vm()->get_breakpoint_type_at_addr(
+                                syscall_instruction) == BKPT_INTERNAL;
+      if (reached_target) {
+        // Emulate syscall state change
+        Registers r = t->regs();
+        r.set_ip(
+            syscall_instruction.increment_by_syscall_insn_length(t->arch()));
+        r.set_original_syscallno(r.syscallno());
+        r.set_syscall_result(-ENOSYS);
+        t->set_regs(r);
+        t->canonicalize_regs(current_trace_frame().event().Syscall().arch());
+        t->validate_regs();
+        clear_syscall_bp();
+      } else {
+        return INCOMPLETE;
+      }
+    } else {
+      // If we use the breakpoint optimization, we must get a SIGTRAP before
+      // reaching a syscall, so cont_syscall_boundary must return INCOMPLETE.
+      ASSERT(t, !syscall_bp_vm);
+      t->canonicalize_regs(current_trace_frame().event().Syscall().arch());
+      t->validate_regs();
+      t->finish_emulated_syscall();
+    }
   }
-  validate_args(current_step.syscall.number, SYSCALL_ENTRY, t);
+
+  if (current_trace_frame().event().Syscall().state == ENTERING_SYSCALL) {
+    rep_after_enter_syscall(t);
+  }
   return COMPLETE;
 }
 
@@ -382,280 +584,161 @@ Completion ReplaySession::enter_syscall(Task* t, RunCommand stepi) {
  * Advance past the reti (or virtual reti) according to |step|.
  * Return COMPLETE if successful, or INCOMPLETE if an unhandled trap occurred.
  */
-Completion ReplaySession::exit_syscall(Task* t, RunCommand stepi) {
-  ExecOrEmulate emu = current_step.syscall.emu;
+Completion ReplaySession::exit_syscall(ReplayTask* t) {
+  t->on_syscall_exit(current_step.syscall.number, current_step.syscall.arch,
+                     current_trace_frame().regs());
 
-  if (emu == EXEC) {
-    if (cont_syscall_boundary(t, emu, stepi) == INCOMPLETE) {
-      return INCOMPLETE;
-    }
-  }
+  t->apply_all_data_records_from_trace();
+  t->set_return_value_from_trace();
 
-  for (int i = 0; i < current_step.syscall.num_emu_args; ++i) {
-    t->set_data_from_trace();
+  uint32_t flags = 0;
+  if (t->arch() == SupportedArch::x86 &&
+      (X86Arch::pwrite64 == current_step.syscall.number ||
+       X86Arch::pread64 == current_step.syscall.number)) {
+    flags |= ReplayTask::IGNORE_ESI;
   }
-  if (current_step.syscall.emu_ret) {
-    t->set_return_value_from_trace();
-  }
-  validate_args(current_step.syscall.number, SYSCALL_EXIT, t);
+  t->validate_regs(flags);
 
-  if (emu == EMULATE) {
-    t->finish_emulated_syscall();
-  }
   return COMPLETE;
 }
 
-/**
- * Advance |t| to the next signal or trap.  If |stepi| is |SINGLESTEP|,
- * then execution resumes by single-stepping.  Otherwise it continues
- * normally.  The delivered signal is recorded in |t->child_sig|.
- */
-void ReplaySession::continue_or_step(Task* t, RunCommand stepi,
-                                     int64_t tick_period) {
-  int child_sig_gt_zero;
-
-  ResumeRequest resume_how;
-  if (stepi == RUN_SINGLESTEP) {
-    resume_how = RESUME_SINGLESTEP;
-  } else {
-    /* We continue with RESUME_SYSCALL for error checking:
-     * since the next event is supposed to be a signal,
-     * entering a syscall here means divergence.  There
-     * shouldn't be any straight-line execution overhead
-     * for SYSCALL vs. CONT, so the difference in cost
-     * should be neglible. */
-    resume_how = RESUME_SYSCALL;
+void ReplaySession::check_pending_sig(ReplayTask* t) {
+  if (!t->stop_sig()) {
+    ASSERT(t, false) << "Replaying `" << trace_frame.event()
+                     << "': expecting tracee signal or trap, but instead at `"
+                     << syscall_name(t->regs().original_syscallno(),
+                                     t->detect_syscall_arch())
+                     << "' (ticks: " << t->tick_count() << ")";
   }
-  t->resume_execution(resume_how, RESUME_WAIT, 0, tick_period);
-
-  t->child_sig = t->pending_sig();
-  child_sig_gt_zero = (0 < t->child_sig);
-  if (child_sig_gt_zero) {
-    return;
-  }
-  ASSERT(t, child_sig_gt_zero)
-      << "Replaying `" << Event(trace_frame.event())
-      << "': expecting tracee signal or trap, but instead at `"
-      << t->syscallname(t->regs().original_syscallno())
-      << "' (ticks: " << t->tick_count() << ")";
 }
 
 /**
- * Return nonzero if |t| was stopped for a breakpoint trap (int3),
- * as opposed to a trace trap.  Return zero in the latter case.
- */
-static bool is_breakpoint_trap(Task* t) {
-  assert(SIGTRAP == t->child_sig);
-
-  const siginfo_t& si = t->get_siginfo();
-  assert(SIGTRAP == si.si_signo);
-
-  /* XXX unable to find docs on which of these "should" be
-   * right.  The SI_KERNEL code is seen in the int3 test, so we
-   * at least need to handle that. */
-  return SI_KERNEL == si.si_code || TRAP_BRKPT == si.si_code;
-}
-
-/**
- * Return one of the (non-zero) enumerated TRAP_* debugger-trap types
- * above if the SIGTRAP generated by the child is intended for the
- * debugger, or zero if it's meant for rr internally.
+ * Advance |t| to the next signal or trap according to |constraints.command|.
  *
- * NB: calling this function while advancing the ticks counter through hpc
- * interrupts when emulating asynchronous signal delivery *will*
- * result in bad results.  Don't call this function from there; it's
- * not necessary.
+ * Default |resume_how| is RESUME_SYSEMU for error checking:
+ * since the next event is supposed to be a signal, entering a syscall here
+ * means divergence.  There shouldn't be any straight-line execution overhead
+ * for SYSEMU vs. CONT, so the difference in cost should be negligible.
+ *
+ * Some callers pass RESUME_CONT because they want to execute any syscalls
+ * encountered.
+ *
+ * If we return INCOMPLETE, callers need to recalculate the constraints and
+ * tick_request and try again. We may return INCOMPLETE because we successfully
+ * processed a CPUID trap.
  */
-enum ExecStateType {
-  UNKNOWN,
-  NOT_AT_TARGET,
-  AT_TARGET
-};
-TrapType ReplaySession::compute_trap_type(Task* t, int target_sig,
-                                          SignalDeterministic deterministic,
-                                          ExecStateType exec_state,
-                                          RunCommand stepi) {
-  TrapType trap_type;
-
-  assert(SIGTRAP == t->child_sig);
-
-  /* We're not replaying a trap, and it was clearly raised on
-   * behalf of the debugger.  (The debugger will verify
-   * that.) */
-  if (SIGTRAP != target_sig
-          /* Replay of deterministic signals never internally
-           * single-steps or sets internal breakpoints. */
-      &&
-      (DETERMINISTIC_SIG == deterministic
-           /* Replay of async signals will sometimes internally
-            * single-step when advancing to an execution target,
-            * so the trap was only clearly for the debugger if
-            * the debugger was requesting single-stepping. */
-       ||
-       (stepi == RUN_SINGLESTEP && NOT_AT_TARGET == exec_state))) {
-    return stepi == RUN_SINGLESTEP ? TRAP_STEPI : TRAP_BKPT_USER;
+Completion ReplaySession::continue_or_step(ReplayTask* t,
+                                           const StepConstraints& constraints,
+                                           TicksRequest tick_request,
+                                           ResumeRequest resume_how) {
+  if (constraints.command == RUN_SINGLESTEP) {
+    t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, tick_request);
+    handle_unrecorded_cpuid_fault(t, constraints);
+  } else if (constraints.command == RUN_SINGLESTEP_FAST_FORWARD) {
+    did_fast_forward |= fast_forward_through_instruction(
+        t, RESUME_SINGLESTEP, constraints.stop_before_states);
+    handle_unrecorded_cpuid_fault(t, constraints);
+  } else {
+    t->resume_execution(resume_how, RESUME_WAIT, tick_request);
+    if (t->stop_sig() == 0) {
+      auto type = AddressSpace::rr_page_syscall_from_exit_point(t->ip());
+      if (type && type->traced == AddressSpace::UNTRACED) {
+        // If we recorded an rr replay of an application doing a
+        // syscall-buffered 'mprotect', the replay's `flush_syscallbuf`
+        // PTRACE_CONT'ed to execute the mprotect syscall and nothing was
+        // recorded for that until we hit the replay's breakpoint, when we
+        // record a SIGTRAP. However, when we replay that SIGTRAP via
+        // `emulate_deterministic_signal`, we call `continue_or_step`
+        // with `RESUME_SYSEMU` (to detect bugs when we reach a stray
+        // syscall instead of the SIGTRAP). So, we'll stop for the
+        // `mprotect` syscall here. We need to execute it and continue
+        // as if it wasn't hit.
+        // (Alternatively we could just replay with RESUME_CONT, but that
+        // would make it harder to track down bugs. There is a performance hit
+        // to stopping for each mprotect, but replaying recordings of replays
+        // is not fast anyway.)
+        perform_interrupted_syscall(t);
+        return INCOMPLETE;
+      }
+    } else if (handle_unrecorded_cpuid_fault(t, constraints)) {
+      return INCOMPLETE;
+    }
   }
-
-  /* We're trying to replay a deterministic SIGTRAP, or we're
-   * replaying an async signal. */
-
-  trap_type = t->vm()->get_breakpoint_type_for_retired_insn(t->ip());
-  if (TRAP_BKPT_USER == trap_type || TRAP_BKPT_INTERNAL == trap_type) {
-    assert(is_breakpoint_trap(t));
-    return trap_type;
-  }
-
-  if (is_breakpoint_trap(t)) {
-    /* We successfully replayed a recorded deterministic
-     * SIGTRAP.  (Because it must have been raised by an
-     * |int3|, but not one we injected.)  Not for the
-     * debugger, although we'll end up notifying it
-     * anyway. */
-    assert(DETERMINISTIC_SIG == deterministic);
-    return TRAP_NONE;
-  }
-
-  if (DETERMINISTIC_SIG == deterministic) {
-    /* If the delivery of SIGTRAP is supposed to be
-     * deterministic and we didn't just retire an |int 3|
-     * and this wasn't a breakpoint, we must have been
-     * single stepping.  So definitely for the
-     * debugger. */
-    assert(stepi == RUN_SINGLESTEP);
-    return TRAP_STEPI;
-  }
-
-  /* We're replaying an async signal. */
-
-  if (AT_TARGET == exec_state) {
-    /* If we're at the target of the async signal
-     * delivery, prefer delivering the signal to retiring
-     * a possible debugger single-step; we'll notify the
-     * debugger anyway. */
-    return TRAP_NONE;
-  }
-
-  /* Otherwise, we're not at the execution target, so may have
-   * been internally single-stepping.  We'll notify the debugger
-   * if it was also requesting single-stepping.  The debugger
-   * won't care about the rr-internal trap if it wasn't
-   * requesting single-stepping. */
-  return stepi == RUN_SINGLESTEP ? TRAP_STEPI : TRAP_NONE;
+  check_pending_sig(t);
+  return COMPLETE;
 }
 
-/**
- * Shortcut for callers that don't care about internal breakpoints.
- * Return nonzero if |t|'s trap is for the debugger, zero otherwise.
- */
-bool ReplaySession::is_debugger_trap(Task* t, int target_sig,
-                                     SignalDeterministic deterministic,
-                                     ExecStateType exec_state,
-                                     RunCommand stepi) {
-  TrapType type =
-      compute_trap_type(t, target_sig, deterministic, exec_state, stepi);
-  assert(TRAP_BKPT_INTERNAL != type);
-  return TRAP_NONE != type;
-}
-
-static void guard_overshoot(Task* t, const Registers& target_regs,
+static void guard_overshoot(ReplayTask* t, const Registers& target_regs,
                             Ticks target_ticks, Ticks remaining_ticks,
-                            Ticks ticks_slack, bool ignored_early_match,
-                            Ticks ticks_left_at_ignored_early_match) {
-  if (remaining_ticks < -ticks_slack) {
-    remote_ptr<uint8_t> target_ip = target_regs.ip();
+                            const Registers* closest_matching_regs) {
+  if (remaining_ticks < 0) {
+    remote_code_ptr target_ip = target_regs.ip();
 
-    LOG(error) << "Replay diverged.  Dumping register comparison.";
     /* Cover up the internal breakpoint that we may have
      * set, and restore the tracee's $ip to what it would
      * have been had it not hit the breakpoint (if it did
      * hit the breakpoint).*/
-    t->vm()->remove_breakpoint(target_ip, TRAP_BKPT_INTERNAL);
-    if (remote_ptr<uint8_t>(t->regs().ip()) ==
-        target_ip + sizeof(AddressSpace::breakpoint_insn)) {
+    t->vm()->remove_breakpoint(target_ip, BKPT_INTERNAL);
+    if (t->regs().ip() == target_ip.increment_by_bkpt_insn_length(t->arch())) {
       t->move_ip_before_breakpoint();
     }
-    compare_register_files(t, "rep overshoot", t->regs(), "rec", target_regs,
-                           LOG_MISMATCHES);
-    if (ignored_early_match) {
-      ASSERT(t, false) << "overshot target ticks=" << target_ticks << " by "
-                       << -remaining_ticks << "; ignored early match with "
-                       << ticks_left_at_ignored_early_match << " ticks left";
+    if (closest_matching_regs) {
+      LOG(error)
+          << "Replay diverged; target registers at ticks target mismatched: ";
+      Registers::compare_register_files(t, "rep overshoot", t->regs(), "rec",
+                                        *closest_matching_regs, LOG_MISMATCHES);
     } else {
-      ASSERT(t, false) << "overshot target ticks=" << target_ticks << " by "
-                       << -remaining_ticks;
+      LOG(error) << "Replay diverged; target registers mismatched: ";
+      Registers::compare_register_files(t, "rep overshoot", t->regs(), "rec",
+                                        target_regs, LOG_MISMATCHES);
     }
+    ASSERT(t, false) << "overshot target ticks=" << target_ticks << " by "
+                     << -remaining_ticks;
   }
 }
 
-static void guard_unexpected_signal(Task* t) {
-  Event ev;
-  int child_sig_is_zero_or_sigtrap =
-      (0 == t->child_sig || SIGTRAP == t->child_sig);
-  /* "0" normally means "syscall", but continue_or_step() guards
-   * against unexpected syscalls.  So the caller must have set
-   * "0" intentionally. */
-  if (child_sig_is_zero_or_sigtrap) {
+static void guard_unexpected_signal(ReplayTask* t) {
+  if (ReplaySession::is_ignored_signal(t->stop_sig()) ||
+      SIGTRAP == t->stop_sig()) {
     return;
   }
-  if (t->child_sig) {
-    ev = SignalEvent(t->child_sig, NONDETERMINISTIC_SIG, t->arch());
-  } else {
-    ev = SyscallEvent(max(0L, (long)t->regs().original_syscallno()), t->arch());
+
+  if (t->stop_sig()) {
+    ASSERT(t, false) << "Replay got unrecorded signal "
+                     << signal_name(t->stop_sig()) << " while awaiting signal";
+  } else if (t->status().is_syscall()) {
+    ASSERT(t, false) << "Replay got unrecorded syscall "
+                     << syscall_name(t->regs().original_syscallno(), t->arch())
+                     << " while awaiting signal";
   }
-  ASSERT(t, child_sig_is_zero_or_sigtrap) << "Replay got unrecorded event "
-                                          << ev << " while awaiting signal";
 }
 
-static bool is_same_execution_point(Task* t, const Registers& rec_regs,
-                                    Ticks ticks_left, Ticks ticks_slack,
-                                    bool* ignoring_early_match,
-                                    Ticks* ticks_left_at_ignored_early_match) {
-  int behavior =
-#ifdef DEBUGTAG
-      LOG_MISMATCHES
-#else
-      EXPECT_MISMATCHES
-#endif
-      ;
-  if (ticks_left > 0) {
-    if (ticks_left <= ticks_slack &&
-        compare_register_files(t, "(rep)", t->regs(), "(rec)", rec_regs,
-                               EXPECT_MISMATCHES)) {
-      *ignoring_early_match = true;
-      *ticks_left_at_ignored_early_match = ticks_left;
+static bool is_same_execution_point(ReplayTask* t, const Registers& rec_regs,
+                                    Ticks ticks_left,
+                                    Registers* mismatched_regs,
+                                    const Registers** mismatched_regs_ptr) {
+  MismatchBehavior behavior =
+      IS_LOGGING(debug) ? LOG_MISMATCHES : EXPECT_MISMATCHES;
+
+  if (ticks_left != 0) {
+    LOG(debug) << "  not same execution point: " << ticks_left
+               << " ticks left (@" << rec_regs.ip() << ")";
+    if (IS_LOGGING(debug)) {
+      Registers::compare_register_files(t, "(rep)", t->regs(), "(rec)",
+                                        rec_regs, LOG_MISMATCHES);
     }
-    LOG(debug) << "  not same execution point: " << ticks_left
-               << " ticks left (@" << HEX(rec_regs.ip()) << ")";
-#ifdef DEBUGTAG
-    compare_register_files(t, "(rep)", t->regs(), "(rec)", rec_regs,
-                           LOG_MISMATCHES);
-#endif
     return false;
   }
-  if (ticks_left < -ticks_slack) {
-    LOG(debug) << "  not same execution point: " << ticks_left
-               << " ticks left (@" << HEX(rec_regs.ip()) << ")";
-#ifdef DEBUGTAG
-    compare_register_files(t, "(rep)", t->regs(), "(rec)", rec_regs,
-                           LOG_MISMATCHES);
-#endif
-    return false;
-  }
-  if (!compare_register_files(t, "rep", t->regs(), "rec", rec_regs, behavior)) {
-    LOG(debug) << "  not same execution point: regs differ (@"
-               << HEX(rec_regs.ip()) << ")";
+  if (!Registers::compare_register_files(t, "rep", t->regs(), "rec", rec_regs,
+                                         behavior)) {
+    LOG(debug) << "  not same execution point: regs differ (@" << rec_regs.ip()
+               << ")";
+    *mismatched_regs = t->regs();
+    *mismatched_regs_ptr = mismatched_regs;
     return false;
   }
   LOG(debug) << "  same execution point";
   return true;
-}
-
-Ticks ReplaySession::get_ticks_slack(Task* t) {
-  if (cpuid_bug_detector.is_cpuid_bug_detected()) {
-    // Somewhat arbitrary guess
-    return 6;
-  }
-  return 0;
 }
 
 /**
@@ -667,29 +750,35 @@ Ticks ReplaySession::get_ticks_slack(Task* t) {
  * that will be decremented by branches retired during this attempted
  * step.
  */
-Completion ReplaySession::advance_to(Task* t, const Registers& regs, int sig,
-                                     RunCommand stepi, Ticks ticks) {
-  pid_t tid = t->tid;
-  remote_ptr<uint8_t> ip = regs.ip();
-  Ticks ticks_left;
-  Ticks ticks_slack = get_ticks_slack(t);
+Completion ReplaySession::emulate_async_signal(
+    ReplayTask* t, const StepConstraints& constraints, Ticks ticks) {
+  const Registers& regs = trace_frame.regs();
+  remote_code_ptr ip = regs.ip();
   bool did_set_internal_breakpoint = false;
-  bool ignored_early_match = false;
-  Ticks ticks_left_at_ignored_early_match = 0;
-
-  assert(t->hpc.ticks_fd() > 0);
-  assert(t->child_sig == 0);
 
   /* Step 1: advance to the target ticks (minus a slack region) as
    * quickly as possible by programming the hpc. */
-  ticks_left = ticks - t->tick_count();
+  Ticks ticks_left = ticks - t->tick_count();
 
   LOG(debug) << "advancing " << ticks_left << " ticks to reach " << ticks << "/"
              << ip;
 
   /* XXX should we only do this if (ticks > 10000)? */
-  while (ticks_left - SKID_SIZE > SKID_SIZE) {
-    if (SIGTRAP == t->child_sig) {
+  while (ticks_left - PerfCounters::skid_size() > PerfCounters::skid_size()) {
+    LOG(debug) << "  programming interrupt for "
+               << (ticks_left - PerfCounters::skid_size()) << " ticks";
+
+    // Avoid overflow. If ticks_left > MAX_TICKS_REQUEST, execution will stop
+    // early but we'll treat that just like a stray TIME_SLICE_SIGNAL and
+    // continue as needed.
+    continue_or_step(t, constraints,
+                     (TicksRequest)(min<Ticks>(MAX_TICKS_REQUEST, ticks_left) -
+                                    PerfCounters::skid_size()));
+    guard_unexpected_signal(t);
+
+    ticks_left = ticks - t->tick_count();
+
+    if (SIGTRAP == t->stop_sig()) {
       /* We proved we're not at the execution
        * target, and we haven't set any internal
        * breakpoints, and we're not temporarily
@@ -699,30 +788,13 @@ Completion ReplaySession::advance_to(Task* t, const Registers& regs, int sig,
        * debugging code will verify that.) */
       return INCOMPLETE;
     }
-    t->child_sig = 0;
-
-    LOG(debug) << "  programming interrupt for " << (ticks_left - SKID_SIZE)
-               << " ticks";
-
-    continue_or_step(t, stepi, ticks_left - SKID_SIZE);
-    if (PerfCounters::TIME_SLICE_SIGNAL == t->child_sig ||
-        is_ignored_replay_signal(t->child_sig)) {
-      t->child_sig = 0;
-    }
-    guard_unexpected_signal(t);
-
-    /* TODO this assertion won't catch many spurious
-     * signals; should assert that the siginfo says the
-     * source is io-ready and the fd is the child's fd. */
-    if (fcntl(t->hpc.ticks_fd(), F_GETOWN) != tid) {
-      FATAL() << "Scheduled task " << tid
-              << " doesn't own hpc; replay divergence";
-    }
-
-    ticks_left = ticks - t->tick_count();
   }
-  guard_overshoot(t, regs, ticks, ticks_left, ticks_slack, ignored_early_match,
-                  ticks_left_at_ignored_early_match);
+  guard_overshoot(t, regs, ticks, ticks_left, NULL);
+
+  /* True when our advancing has triggered a tracee SIGTRAP that needs to
+   * be dealt with. */
+  bool pending_SIGTRAP = false;
+  RunCommand SIGTRAP_run_command = RUN_CONTINUE;
 
   /* Step 2: more slowly, find our way to the target ticks and
    * execution point.  We set an internal breakpoint on the
@@ -736,13 +808,15 @@ Completion ReplaySession::advance_to(Task* t, const Registers& regs, int sig,
    * What we really want to do is set a (precise)
    * retired-instruction interrupt and do away with all this
    * cruft. */
+  Registers mismatched_regs;
+  const Registers* mismatched_regs_ptr = NULL;
   while (true) {
     /* Invariants here are
      *  o ticks_left is up-to-date
-     *  o ticks_left >= -ticks_slack
+     *  o ticks_left >= 0
      *
      * Possible state of the execution of |t|
-     *  0. at a debugger trap (breakpoint or stepi)
+     *  0. at a debugger trap (breakpoint, watchpoint, stepi)
      *  1. at an internal breakpoint
      *  2. at the execution target
      *  3. not at the execution target, but incidentally
@@ -750,61 +824,70 @@ Completion ReplaySession::advance_to(Task* t, const Registers& regs, int sig,
      *  4. otherwise not at the execution target
      *
      * Determining whether we're at a debugger trap is
-     * surprisingly complicated, but we delegate the work
-     * to |compute_debugger_trap()|.  The rest can be
-     * straightforwardly computed with ticks value and
-     * registers. */
+     * surprisingly complicated. */
     bool at_target = is_same_execution_point(
-        t, regs, ticks_left, ticks_slack, &ignored_early_match,
-        &ticks_left_at_ignored_early_match);
-    if (SIGTRAP == t->child_sig) {
-      TrapType trap_type =
-          compute_trap_type(t, sig, NONDETERMINISTIC_SIG,
-                            at_target ? AT_TARGET : NOT_AT_TARGET, stepi);
-      switch (trap_type) {
-        case TRAP_BKPT_USER:
-        case TRAP_STEPI:
-          /* Case (0) above: interrupt for the
-           * debugger. */
-          LOG(debug) << "    trap was debugger interrupt " << trap_type;
-          if (did_set_internal_breakpoint) {
-            t->vm()->remove_breakpoint(ip, TRAP_BKPT_INTERNAL);
-            did_set_internal_breakpoint = false;
-          }
-          return INCOMPLETE;
-        case TRAP_BKPT_INTERNAL: {
-          /* Case (1) above: cover the tracks of
-           * our internal breakpoint, and go
-           * check again if we're at the
-           * target. */
-          LOG(debug) << "    trap was for target $ip";
-          /* (The breakpoint would have trapped
-           * at the $ip one byte beyond the
-           * target.) */
-          assert(!at_target);
+        t, regs, ticks_left, &mismatched_regs, &mismatched_regs_ptr);
+    if (pending_SIGTRAP) {
+      TrapReasons trap_reasons = t->compute_trap_reasons();
+      BreakpointType breakpoint_type =
+          t->vm()->get_breakpoint_type_for_retired_insn(t->ip());
 
-          t->child_sig = 0;
-          t->move_ip_before_breakpoint();
-          /* We just backed up the $ip, but
-           * rewound it over an |int $3|
-           * instruction, which couldn't have
-           * retired a branch.  So we don't need
-           * to adjust |ticks_count()|. */
-          continue;
+      if (constraints.is_singlestep()) {
+        ASSERT(t, trap_reasons.singlestep);
+      }
+      if (constraints.is_singlestep() ||
+          (trap_reasons.watchpoint && t->vm()->has_any_watchpoint_changes()) ||
+          (trap_reasons.breakpoint && BKPT_USER == breakpoint_type)) {
+        /* Case (0) above: interrupt for the debugger. */
+        LOG(debug) << "    trap was debugger singlestep/breakpoint";
+        if (did_set_internal_breakpoint) {
+          t->vm()->remove_breakpoint(ip, BKPT_INTERNAL);
         }
-        case TRAP_NONE:
-          /* Otherwise, we must have been forced
-           * to single-step because the tracee's
-           * $ip was incidentally the same as
-           * the target.  Unfortunately, it's
-           * awkward to assert that here, so we
-           * don't yet.  TODO. */
-          LOG(debug) << "    (SIGTRAP; stepi'd target $ip)";
-          assert(stepi == RUN_CONTINUE);
-          t->child_sig = 0;
-          break;
+        return INCOMPLETE;
+      }
+
+      if (trap_reasons.breakpoint) {
+        // We didn't hit a user breakpoint, and executing an explicit
+        // breakpoint instruction in the tracee would have triggered a
+        // deterministic signal instead of an async one.
+        // So we must have hit our internal breakpoint.
+        ASSERT(t, did_set_internal_breakpoint);
+        ASSERT(t,
+               regs.ip().increment_by_bkpt_insn_length(t->arch()) == t->ip());
+        // We didn't do an internal singlestep, and if we'd done a
+        // user-requested singlestep we would have hit the above case.
+        ASSERT(t, !trap_reasons.singlestep);
+        /* Case (1) above: cover the tracks of
+         * our internal breakpoint, and go
+         * check again if we're at the
+         * target. */
+        LOG(debug) << "    trap was for target $ip";
+        /* (The breakpoint would have trapped
+         * at the $ip one byte beyond the
+         * target.) */
+        DEBUG_ASSERT(!at_target);
+
+        pending_SIGTRAP = false;
+        t->move_ip_before_breakpoint();
+        /* We just backed up the $ip, but
+         * rewound it over an |int $3|
+         * instruction, which couldn't have
+         * retired a branch.  So we don't need
+         * to adjust |tick_count()|. */
+        continue;
+      }
+
+      /* Otherwise, either we did an internal singlestep or a hardware
+       * watchpoint fired but values didn't change. */
+      if (trap_reasons.singlestep) {
+        ASSERT(t, is_singlestep(SIGTRAP_run_command));
+        LOG(debug) << "    (SIGTRAP; stepi'd target $ip)";
+      } else {
+        ASSERT(t, trap_reasons.watchpoint);
+        LOG(debug) << "    (SIGTRAP; HW watchpoint fired without changes)";
       }
     }
+
     /* We had to keep the internal breakpoint set (if it
      * was when we entered the loop) for the checks above.
      * But now we're either done (at the target) or about
@@ -812,14 +895,11 @@ Completion ReplaySession::advance_to(Task* t, const Registers& regs, int sig,
      * and it's simpler to start out knowing that the
      * breakpoint isn't set. */
     if (did_set_internal_breakpoint) {
-      t->vm()->remove_breakpoint(ip, TRAP_BKPT_INTERNAL);
+      t->vm()->remove_breakpoint(ip, BKPT_INTERNAL);
       did_set_internal_breakpoint = false;
     }
 
     if (at_target) {
-      // Adjust dynamic ticks count to match trace, in case
-      // there was slack.
-      t->set_tick_count(ticks);
       /* Case (2) above: done. */
       return COMPLETE;
     }
@@ -842,53 +922,71 @@ Completion ReplaySession::advance_to(Task* t, const Registers& regs, int sig,
        * no slower than single-stepping our way to
        * the target execution point. */
       LOG(debug) << "    breaking on target $ip";
-      t->vm()->set_breakpoint(ip, TRAP_BKPT_INTERNAL);
+      t->vm()->add_breakpoint(ip, BKPT_INTERNAL);
       did_set_internal_breakpoint = true;
-      continue_or_step(t, stepi);
+      continue_or_step(t, constraints, RESUME_UNLIMITED_TICKS);
+      SIGTRAP_run_command = constraints.command;
     } else {
       /* Case (3) above: we can't put a breakpoint
        * on the $ip, because resuming execution
        * would just trap and we'd be back where we
-       * started.  Single-step past it. */
-      LOG(debug) << "    (single-stepping over target $ip)";
-      continue_or_step(t, RUN_SINGLESTEP);
+       * started.  Single-step or fast-forward past it. */
+      LOG(debug) << "    (fast-forwarding over target $ip)";
+      /* Just do whatever the user asked for if the user requested
+       * singlestepping
+       * or there is user breakpoint at the run address. The latter is safe
+       * because the breakpoint will be triggered immediately. This gives us the
+       * invariant that an internal singlestep never triggers a user breakpoint.
+       */
+      if (constraints.command == RUN_SINGLESTEP ||
+          t->vm()->get_breakpoint_type_at_addr(t->regs().ip()) == BKPT_USER) {
+        continue_or_step(t, constraints, RESUME_UNLIMITED_TICKS);
+        SIGTRAP_run_command = constraints.command;
+      } else {
+        vector<const Registers*> states = constraints.stop_before_states;
+        // This state may not be relevant if we don't have the correct tick
+        // count yet. But it doesn't hurt to push it on anyway.
+        states.push_back(&regs);
+        did_fast_forward |=
+            fast_forward_through_instruction(t, RESUME_SINGLESTEP, states);
+        SIGTRAP_run_command = RUN_SINGLESTEP_FAST_FORWARD;
+        check_pending_sig(t);
+      }
     }
-
-    if (PerfCounters::TIME_SLICE_SIGNAL == t->child_sig ||
-        is_ignored_replay_signal(t->child_sig)) {
-      /* We don't usually expect a time-slice signal
-       * during this phase, but it's possible for an
-       * ignored signal to interrupt the previous
-       * step just as the tracee enters the slack
-       * region, i.e., where a ticks signal was just
-       * about to fire.  (There's not really a
-       * non-racy way to disable the ticks interrupt,
-       * and we need to keep the counter running for
-       * overshoot checking anyway.)  So this is the
-       * most convenient way to squelch that
-       * "spurious" signal. */
-      t->child_sig = 0;
-    }
-    guard_unexpected_signal(t);
+    pending_SIGTRAP = SIGTRAP == t->stop_sig();
 
     /* Maintain the "'ticks_left'-is-up-to-date"
      * invariant. */
     ticks_left = ticks - t->tick_count();
-    guard_overshoot(t, regs, ticks, ticks_left, ticks_slack,
-                    ignored_early_match, ticks_left_at_ignored_early_match);
+
+    /* Sometimes (e.g. in the ptrace_signal_32 test), we're in almost
+     * the correct state when we enter |advance_to|, except that exotic
+     * registers (i.e. segment registers) need to be normalized by the kernel
+     * by continuing and hitting a deterministic signal without actually
+     * advancing execution. So we allow |advance_to| to proceed and actually
+     * reach the desired state.
+     */
+    if (!is_same_execution_point(t, regs, ticks_left, &mismatched_regs,
+                                 &mismatched_regs_ptr)) {
+      guard_unexpected_signal(t);
+    }
+
+    guard_overshoot(t, regs, ticks, ticks_left, mismatched_regs_ptr);
   }
+}
+
+static bool is_fatal_default_action(int sig) {
+  signal_action action = default_action(sig);
+  return action == DUMP_CORE || action == TERMINATE;
 }
 
 /**
  * Emulates delivery of |sig| to |oldtask|.  Returns INCOMPLETE if
  * emulation was interrupted, COMPLETE if completed.
  */
-Completion ReplaySession::emulate_signal_delivery(Task* oldtask, int sig) {
-  // We are now at the exact point in the child where the signal
-  // was recorded, emulate it using the next trace frame (records
-  // the state at sighandler entry).
-  advance_to_next_trace_frame();
-  Task* t = current_task();
+Completion ReplaySession::emulate_signal_delivery(ReplayTask* oldtask,
+                                                  int sig) {
+  ReplayTask* t = current_task();
   if (!t) {
     // Trace terminated abnormally.  We'll pop out to code
     // that knows what to do.
@@ -896,56 +994,49 @@ Completion ReplaySession::emulate_signal_delivery(Task* oldtask, int sig) {
   }
   ASSERT(oldtask, t == oldtask) << "emulate_signal_delivery changed task";
 
-  ASSERT(t, trace_frame.event().type == EV_SIGNAL_DELIVERY ||
-                trace_frame.event().type == EV_SIGNAL_HANDLER)
+  const Event& ev = trace_frame.event();
+  ASSERT(t, ev.type() == EV_SIGNAL_DELIVERY || ev.type() == EV_SIGNAL_HANDLER)
       << "Unexpected signal disposition";
   // Entering a signal handler seems to clear FP/SSE registers for some
   // reason. So we saved those cleared values, and now we restore that
   // state so they're cleared during replay.
-  if (trace_frame.event().type == EV_SIGNAL_HANDLER) {
+  if (ev.type() == EV_SIGNAL_HANDLER) {
     t->set_extra_regs(trace_frame.extra_regs());
   }
 
   /* Restore the signal-hander frame data, if there was one. */
-  SignalDeterministic deterministic =
-      Event(trace_frame.event()).Signal().deterministic;
   bool restored_sighandler_frame = 0 < t->set_data_from_trace();
   if (restored_sighandler_frame) {
-    t->push_event(SignalEvent(sig, deterministic, t->arch()));
-    t->ev().transform(EV_SIGNAL_DELIVERY);
-    LOG(debug) << "--> restoring sighandler frame for " << signalname(sig);
-    t->ev().transform(EV_SIGNAL_HANDLER);
-  } else if (possibly_destabilizing_signal(t, sig, deterministic)) {
-    t->push_event(SignalEvent(sig, deterministic, t->arch()));
-    t->ev().transform(EV_SIGNAL_DELIVERY);
-    t->destabilize_task_group();
-    t->pop_signal_delivery();
+    LOG(debug) << "--> restoring sighandler frame for " << signal_name(sig);
   }
+  // Note that fatal signals are not actually injected into the task!
+  // This is very important; we must never actually inject fatal signals
+  // into a task. All replay task death must go through exit_task.
   /* If this signal had a user handler, and we just set up the
    * callframe, and we need to restore the $sp for continued
    * execution. */
   t->set_regs(trace_frame.regs());
-  /* Delivered the signal. */
-  t->child_sig = 0;
 
-  validate_args(0, SYSCALL_ENTRY, t);
+  t->validate_regs();
   return COMPLETE;
 }
 
-void ReplaySession::check_ticks_consistency(Task* t, const Event& ev) {
-  if (!can_validate() || trace_frame.event().has_exec_info == NO_EXEC_INFO) {
+void ReplaySession::check_ticks_consistency(ReplayTask* t, const Event& ev) {
+  if (!done_initial_exec()) {
     return;
   }
 
-  Ticks ticks_slack = get_ticks_slack(t);
   Ticks ticks_now = t->tick_count();
   Ticks trace_ticks = trace_frame.ticks();
 
-  ASSERT(t, llabs(ticks_now - trace_ticks) <= ticks_slack)
+  ASSERT(t, ticks_now == trace_ticks)
       << "ticks mismatch for '" << ev << "'; expected " << trace_ticks
       << ", got " << ticks_now << "";
-  // Sync task ticks with trace ticks so we don't keep accumulating errors
-  t->set_tick_count(trace_ticks);
+}
+
+static bool treat_signal_event_as_deterministic(const SignalEvent& ev) {
+  return ev.deterministic == DETERMINISTIC_SIG &&
+    ev.siginfo.si_signo != SIGBUS;
 }
 
 /**
@@ -953,295 +1044,116 @@ void ReplaySession::check_ticks_consistency(Task* t, const Event& ev) {
  * update registers to what was recorded.  Return COMPLETE if successful or
  * INCOMPLETE  if an unhandled interrupt occurred.
  */
-Completion ReplaySession::emulate_deterministic_signal(Task* t, int sig,
-                                                       RunCommand stepi) {
-  Event ev(trace_frame.event());
+Completion ReplaySession::emulate_deterministic_signal(
+    ReplayTask* t, int sig, const StepConstraints& constraints) {
+  while (true) {
+    if (t->regs().matches(trace_frame.regs()) &&
+        t->tick_count() == trace_frame.ticks()) {
+      // We're already at the target. This can happen when multiple signals
+      // are delivered with no intervening execution.
+      return COMPLETE;
+    }
 
-  continue_or_step(t, stepi);
-  if (is_ignored_replay_signal(t->child_sig)) {
-    t->child_sig = 0;
-    return emulate_deterministic_signal(t, sig, stepi);
-  } else if (SIGTRAP == t->child_sig &&
-             is_debugger_trap(t, sig, DETERMINISTIC_SIG, UNKNOWN, stepi)) {
-    return INCOMPLETE;
+    auto complete = continue_or_step(t, constraints, RESUME_UNLIMITED_TICKS);
+    if (complete == COMPLETE && !is_ignored_signal(t->stop_sig())) {
+      break;
+    }
   }
-  ASSERT(t, t->child_sig == sig) << "Replay got unrecorded signal "
-                                 << t->child_sig << " (expecting " << sig
-                                 << ")";
+
+  if (SIGTRAP == t->stop_sig()) {
+    TrapReasons trap_reasons = t->compute_trap_reasons();
+    if (trap_reasons.singlestep || trap_reasons.watchpoint) {
+      // Singlestep or watchpoint must have been debugger-requested
+      return INCOMPLETE;
+    }
+    if (trap_reasons.breakpoint) {
+      // An explicit breakpoint instruction in the tracee would produce a
+      // |breakpoint| reason as we emulate the deterministic SIGTRAP.
+      BreakpointType type =
+          t->vm()->get_breakpoint_type_for_retired_insn(t->ip());
+      if (BKPT_NONE != type) {
+        ASSERT(t, BKPT_USER == type);
+        return INCOMPLETE;
+      }
+    }
+  }
+  ASSERT(t, t->stop_sig() == sig)
+      << "Replay got unrecorded signal " << signal_name(t->stop_sig())
+      << " (expecting " << signal_name(sig) << ")";
+  const Event& ev = trace_frame.event();
   check_ticks_consistency(t, ev);
 
-  if (EV_SEGV_RDTSC == ev.type()) {
+  if (EV_INSTRUCTION_TRAP == ev.type()) {
     t->set_regs(trace_frame.regs());
-    /* We just "delivered" this pseudosignal. */
-    t->child_sig = 0;
-    return COMPLETE;
   }
 
-  current_step.action = TSTEP_DELIVER_SIGNAL;
-  return INCOMPLETE;
-}
-
-/**
- * Run execution forwards for |t| until |t->trace.ticks| is reached,
- * and the $ip reaches the recorded $ip.  After that, deliver |sig| if
- * nonzero.  Return COMPLETE if successful or INCOMPLETE if an unhandled
- * interrupt occurred.
- */
-Completion ReplaySession::emulate_async_signal(Task* t, int sig,
-                                               RunCommand stepi, Ticks ticks) {
-  if (advance_to(t, trace_frame.regs(), 0, stepi, ticks) == INCOMPLETE) {
-    return INCOMPLETE;
-  }
-  if (sig) {
-    current_step.action = TSTEP_DELIVER_SIGNAL;
-    current_step.signo = sig;
-    return INCOMPLETE;
-  }
-  return COMPLETE;
-}
-
-/**
- * Skip over the entry/exit of either an arm-desched-event or
- * disarm-desched-event ioctl(), as described by |ds|.  Return INCOMPLETE
- * if an unhandled interrupt occurred, COMPLETE if the ioctl() was
- * successfully skipped over.
- */
-Completion ReplaySession::skip_desched_ioctl(Task* t, ReplayDeschedState* ds,
-                                             RunCommand stepi) {
-  /* Skip ahead to the syscall entry. */
-  if (DESCHED_ENTER == ds->state &&
-      cont_syscall_boundary(t, EMULATE, stepi) == INCOMPLETE) {
-    return INCOMPLETE;
-  }
-  ds->state = DESCHED_EXIT;
-
-  bool is_desched_syscall =
-      (DESCHED_ARM == ds->type ? t->is_arm_desched_event_syscall()
-                               : t->is_disarm_desched_event_syscall());
-  ASSERT(t, is_desched_syscall) << "Failed to reach desched ioctl; at "
-                                << t->syscallname(
-                                       t->regs().original_syscallno()) << "("
-                                << t->regs().arg1() << ", " << t->regs().arg2()
-                                << ") instead";
-  /* Emulate a return value of "0".  It's OK for us to hard-code
-   * that value here, because the syscallbuf lib aborts if a
-   * desched ioctl returns non-zero (it doesn't know how to
-   * handle that). */
-  Registers r = t->regs();
-  r.set_syscall_result(0);
-  t->set_regs(r);
-  t->finish_emulated_syscall();
   return COMPLETE;
 }
 
 /**
  * Restore the recorded syscallbuf data to the tracee, preparing the
- * tracee for replaying the records.  Return the number of record
- * bytes and a pointer to the first record through outparams.
+ * tracee for replaying the records.
  */
-void ReplaySession::prepare_syscallbuf_records(Task* t) {
-  if (!current_step.flush.need_buffer_restore) {
-    return;
-  }
-  current_step.flush.need_buffer_restore = false;
-
+void ReplaySession::prepare_syscallbuf_records(ReplayTask* t) {
   // Read the recorded syscall buffer back into the buffer
   // region.
   auto buf = t->trace_reader().read_raw_data();
-  current_step.flush.num_rec_bytes_remaining = buf.data.size();
+  ASSERT(t, buf.data.size() >= sizeof(struct syscallbuf_hdr));
+  ASSERT(t, buf.data.size() <= t->syscallbuf_size);
+  ASSERT(t, buf.addr == t->syscallbuf_child.cast<void>());
 
-  assert(current_step.flush.num_rec_bytes_remaining <= SYSCALLBUF_BUFFER_SIZE);
-  memcpy(syscallbuf_flush_buffer_array, buf.data.data(),
-         current_step.flush.num_rec_bytes_remaining);
+  struct syscallbuf_hdr recorded_hdr;
+  memcpy(&recorded_hdr, buf.data.data(), sizeof(struct syscallbuf_hdr));
+  // Don't overwrite syscallbuf_hdr. That needs to keep tracking the current
+  // syscallbuf state.
+  t->write_bytes_helper(t->syscallbuf_child + 1,
+                        buf.data.size() - sizeof(struct syscallbuf_hdr),
+                        buf.data.data() + sizeof(struct syscallbuf_hdr));
 
-  // The stored num_rec_bytes in the header doesn't include the
-  // header bytes, but the stored trace data does.
-  current_step.flush.num_rec_bytes_remaining -=
-      sizeof(sizeof(struct syscallbuf_hdr));
-  assert(buf.addr == t->syscallbuf_child);
-  const syscallbuf_hdr* flush_hdr = syscallbuf_flush_buffer_hdr();
-  assert(flush_hdr->num_rec_bytes ==
-         current_step.flush.num_rec_bytes_remaining);
+  ASSERT(t,
+         recorded_hdr.num_rec_bytes + sizeof(struct syscallbuf_hdr) <=
+             t->syscallbuf_size);
 
-  current_step.flush.syscall_record_offset = 0;
+  current_step.flush.stop_breakpoint_addr =
+      t->stopping_breakpoint_table.to_data_ptr<void>().as_int() +
+      (recorded_hdr.num_rec_bytes / 8) *
+          t->stopping_breakpoint_table_entry_size;
 
-  LOG(debug) << "Prepared " << current_step.flush.num_rec_bytes_remaining
+  LOG(debug) << "Prepared " << (uint32_t)recorded_hdr.num_rec_bytes
              << " bytes of syscall records";
 }
 
 /**
- * Bail if |t| isn't at the buffered syscall |syscallno|.
+ * Returns mprotect_record_count
  */
-static void assert_at_buffered_syscall(Task* t, int syscallno) {
-  ASSERT(t, t->is_untraced_syscall())
-      << "Bad ip " << t->ip() << ": should have been buffered-syscall ip";
-  ASSERT(t, t->regs().original_syscallno() == syscallno)
-      << "At " << t->syscallname(t->regs().original_syscallno())
-      << "; should have been at " << t->syscallname(syscallno) << "("
-      << syscallno << ")";
-}
-
-/**
- * Bail if |rec_rec| and |rep_rec| haven't been prepared for the same
- * syscall (including desched'd-ness and reserved extra space).
- */
-static void assert_same_rec(Task* t, const struct syscallbuf_record* rec_rec,
-                            struct syscallbuf_record* rep_rec) {
-  ASSERT(t, (rec_rec->syscallno == rep_rec->syscallno &&
-             rec_rec->desched == rep_rec->desched &&
-             rec_rec->size == rep_rec->size))
-      << "Recorded rec { no=" << rec_rec->syscallno
-      << ", desched:" << rec_rec->desched << ", size: " << rec_rec->size
-      << " } "
-      << "being replayed as { no=" << rep_rec->syscallno
-      << ", desched:" << rep_rec->desched << ", size: " << rep_rec->size
-      << " }";
-}
-
-/**
- * Directly restore the uaddr/uaddr2 outparams that were saved to
- * buffer.  Because the syscallbuf can't use scratch values for the
- * futexes, it can't restore the record data itself.
- */
-static void restore_futex_words(Task* t, const struct syscallbuf_record* rec) {
-  ssize_t extra_data_size = rec->size - sizeof(*rec);
-  bool saved_uaddr2 = (2 * sizeof(uint32_t) == extra_data_size);
-  ASSERT(t, sizeof(uint32_t) == extra_data_size || saved_uaddr2)
-      << "Futex should have saved 4 or 8 bytes, but instead saved "
-      << extra_data_size;
-
-  remote_ptr<int> child_uaddr = t->regs().arg1();
-  auto rec_uaddr = *reinterpret_cast<const int*>(rec->extra_data);
-  t->write_mem(child_uaddr, rec_uaddr);
-
-  if (saved_uaddr2) {
-    remote_ptr<int> child_uaddr2 = t->regs().arg5();
-    auto rec_uaddr2 =
-        *reinterpret_cast<const int*>(rec->extra_data + sizeof(int));
-    t->write_mem(child_uaddr2, rec_uaddr2);
-  }
-}
-
-/**
- * Try to flush one buffered syscall as described by |flush|.  Return
- * INCOMPLETE if an unhandled interrupt occurred, and COMPLETE if the syscall
- * was flushed (in which case |flush->state == DONE|).
- */
-Completion ReplaySession::flush_one_syscall(Task* t, RunCommand stepi) {
-  const syscallbuf_hdr* flush_hdr = syscallbuf_flush_buffer_hdr();
-  const struct syscallbuf_record* rec_rec =
-      (const struct syscallbuf_record*)((uint8_t*)flush_hdr->recs +
-                                        current_step.flush
-                                            .syscall_record_offset);
-  struct syscallbuf_record* child_rec =
-      (struct syscallbuf_record*)((uint8_t*)t->syscallbuf_hdr->recs +
-                                  current_step.flush.syscall_record_offset);
-  int call = rec_rec->syscallno;
-  // TODO: use syscall_defs table information to determine this.
-  ExecOrEmulate emu = is_madvise_syscall(call, t->arch()) ? EXEC : EMULATE;
-
-  switch (current_step.flush.state) {
-    case FLUSH_START:
-      ASSERT(t, 0 == ((uintptr_t)rec_rec & (sizeof(int) - 1)))
-          << "Recorded record must be int-aligned, but instead is " << rec_rec;
-      ASSERT(t, 0 == ((uintptr_t)child_rec & (sizeof(int) - 1)))
-          << "Replaying record must be int-aligned, but instead is %p"
-          << child_rec;
-      ASSERT(t, 0 == rec_rec->desched || 1 == rec_rec->desched)
-          << "Recorded record is corrupted: rec->desched is "
-          << rec_rec->desched;
-      // We'll check at syscall entry that the recorded and
-      // replayed record values match.
-
-      LOG(debug) << "Replaying buffered `" << t->syscallname(call)
-                 << "' (ret:" << rec_rec->ret << ") which does"
-                 << (!rec_rec->desched ? " not" : "") << " use desched event";
-
-      if (!rec_rec->desched) {
-        current_step.flush.state = FLUSH_ENTER;
-      } else {
-        current_step.flush.state = FLUSH_ARM;
-        current_step.flush.desched.type = DESCHED_ARM;
-        current_step.flush.desched.state = DESCHED_ENTER;
-      }
-      return flush_one_syscall(t, stepi);
-
-    case FLUSH_ARM:
-      /* Skip past the ioctl that armed the desched
-       * notification. */
-      LOG(debug) << "  skipping over arm-desched ioctl";
-      if (skip_desched_ioctl(t, &current_step.flush.desched, stepi) ==
-          INCOMPLETE) {
-        return INCOMPLETE;
-      }
-      current_step.flush.state = FLUSH_ENTER;
-      return flush_one_syscall(t, stepi);
-
-    case FLUSH_ENTER:
-      LOG(debug) << "  advancing to buffered syscall entry";
-      if (cont_syscall_boundary(t, emu, stepi) == INCOMPLETE) {
-        return INCOMPLETE;
-      }
-      assert_at_buffered_syscall(t, call);
-      assert_same_rec(t, rec_rec, child_rec);
-      current_step.flush.state = FLUSH_EXIT;
-      return flush_one_syscall(t, stepi);
-
-    case FLUSH_EXIT: {
-      LOG(debug) << "  advancing to buffered syscall exit";
-
-      EmuFs::AutoGc gc(*this, call);
-
-      assert_at_buffered_syscall(t, call);
-
-      // Restore saved trace data.
-      memcpy(child_rec->extra_data, rec_rec->extra_data, rec_rec->size);
-
-      // Restore return value.
-      // TODO: try to share more code with cont_syscall_boundary()
-      if (emu == EXEC) {
-        if (cont_syscall_boundary(t, emu, stepi) == INCOMPLETE) {
-          return INCOMPLETE;
+static uint32_t apply_mprotect_records(ReplayTask* t,
+                                       uint32_t skip_mprotect_records) {
+  uint32_t final_mprotect_record_count =
+      t->read_mem(REMOTE_PTR_FIELD(t->syscallbuf_child, mprotect_record_count));
+  if (skip_mprotect_records < final_mprotect_record_count) {
+    auto records =
+        t->read_mem(REMOTE_PTR_FIELD(t->preload_globals, mprotect_records[0]) +
+                        skip_mprotect_records,
+                    final_mprotect_record_count - skip_mprotect_records);
+    for (size_t i = 0; i < records.size(); ++i) {
+      auto& r = records[i];
+      uint32_t completed_count = t->read_mem(REMOTE_PTR_FIELD(
+          t->syscallbuf_child, mprotect_record_count_completed));
+      if (i >= completed_count) {
+        auto km = t->vm()->read_kernel_mapping(t, r.start);
+        if (km.prot() != r.prot) {
+          // mprotect didn't happen yet.
+          continue;
         }
-        assert_at_buffered_syscall(t, call);
       }
-      Registers r = t->regs();
-      r.set_syscall_result(rec_rec->ret);
-      t->set_regs(r);
-      if (emu == EMULATE) {
-        t->finish_emulated_syscall();
+      t->vm()->protect(t, r.start, r.size, r.prot);
+      if (running_under_rr()) {
+        syscall(SYS_rrcall_mprotect_record, t->tid, (uintptr_t)r.start,
+                (uintptr_t)r.size, r.prot);
       }
-
-      if (is_futex_syscall(call, t->arch())) {
-        restore_futex_words(t, rec_rec);
-      } else if (is_write_syscall(call, t->arch())) {
-        rep_maybe_replay_stdio_write(t);
-      }
-
-      if (!rec_rec->desched) {
-        current_step.flush.state = FLUSH_DONE;
-        return COMPLETE;
-      }
-      current_step.flush.state = FLUSH_DISARM;
-      current_step.flush.desched.type = DESCHED_DISARM;
-      current_step.flush.desched.state = DESCHED_ENTER;
-      return flush_one_syscall(t, stepi);
     }
-    case FLUSH_DISARM:
-      /* And skip past the ioctl that disarmed the desched
-       * notification. */
-      LOG(debug) << "  skipping over disarm-desched ioctl";
-      if (skip_desched_ioctl(t, &current_step.flush.desched, stepi) ==
-          INCOMPLETE) {
-        return INCOMPLETE;
-      }
-      current_step.flush.state = FLUSH_DONE;
-      return COMPLETE;
-
-    default:
-      FATAL() << "Unknown buffer-flush state " << current_step.flush.state;
-      return COMPLETE; /* unreached */
   }
+  return final_mprotect_record_count;
 }
 
 /**
@@ -1250,39 +1162,100 @@ Completion ReplaySession::flush_one_syscall(Task* t, RunCommand stepi) {
  * that flushed the buffer).  Return COMPLETE if successful or INCOMPLETE if an
  * unhandled interrupt occurred.
  */
-Completion ReplaySession::flush_syscallbuf(Task* t, RunCommand stepi) {
-  prepare_syscallbuf_records(t);
+Completion ReplaySession::flush_syscallbuf(ReplayTask* t,
+                                           const StepConstraints& constraints) {
+  bool user_breakpoint_at_addr = false;
 
-  const syscallbuf_hdr* flush_hdr =
-      t->replay_session().syscallbuf_flush_buffer_hdr();
+  while (true) {
+    auto next_rec = t->next_syscallbuf_record();
+    uint32_t skip_mprotect_records = t->read_mem(
+        REMOTE_PTR_FIELD(t->syscallbuf_child, mprotect_record_count_completed));
 
-  while (current_step.flush.num_rec_bytes_remaining > 0) {
-    if (flush_one_syscall(t, stepi) == INCOMPLETE) {
+    TicksRequest ticks_request;
+    if (!compute_ticks_request(t, constraints, &ticks_request)) {
       return INCOMPLETE;
     }
 
-    assert(FLUSH_DONE == current_step.flush.state);
+    bool added = t->vm()->add_breakpoint(
+        current_step.flush.stop_breakpoint_addr, BKPT_INTERNAL);
+    ASSERT(t, added);
+    auto complete =
+        continue_or_step(t, constraints, ticks_request, RESUME_CONT);
+    user_breakpoint_at_addr =
+        t->vm()->get_breakpoint_type_at_addr(
+            current_step.flush.stop_breakpoint_addr) != BKPT_INTERNAL;
+    t->vm()->remove_breakpoint(current_step.flush.stop_breakpoint_addr,
+                               BKPT_INTERNAL);
 
-    const struct syscallbuf_record* record =
-        (const struct syscallbuf_record*)((uint8_t*)flush_hdr->recs +
-                                          current_step.flush
-                                              .syscall_record_offset);
-    size_t stored_rec_size = stored_record_size(record->size);
-    current_step.flush.syscall_record_offset += stored_rec_size;
-    current_step.flush.num_rec_bytes_remaining -= stored_rec_size;
-    current_step.flush.state = FLUSH_START;
+    // Account for buffered syscalls just completed
+    auto end_rec = t->next_syscallbuf_record();
+    while (next_rec != end_rec) {
+      accumulate_syscall_performed();
+      next_rec = next_rec.as_int() + t->stored_record_size(next_rec);
+    }
 
-    LOG(debug) << "  " << current_step.flush.num_rec_bytes_remaining
-               << " bytes remain to flush";
+    // Apply the mprotect records we just completed.
+    apply_mprotect_records(t, skip_mprotect_records);
+
+    if (t->stop_sig() == PerfCounters::TIME_SLICE_SIGNAL) {
+      // This would normally be triggered by constraints.ticks_target but it's
+      // also possible to get stray signals here.
+      return INCOMPLETE;
+    }
+
+    if (complete == COMPLETE && !is_ignored_signal(t->stop_sig())) {
+      break;
+    }
   }
-  return COMPLETE;
+
+  ASSERT(t, t->stop_sig() == SIGTRAP)
+      << "Replay got unexpected signal (or none) " << t->stop_sig();
+  if (t->ip().decrement_by_bkpt_insn_length(t->arch()) ==
+          remote_code_ptr(current_step.flush.stop_breakpoint_addr) &&
+      !user_breakpoint_at_addr) {
+    Registers r = t->regs();
+    r.set_ip(current_step.flush.stop_breakpoint_addr);
+    t->set_regs(r);
+
+    return COMPLETE;
+  }
+
+  return INCOMPLETE;
 }
 
-/** Return true when replaying/debugging should cease after |t| exits. */
-bool ReplaySession::is_last_interesting_task(Task* t) {
-  return (0 == debugged_tgid() && tasks().size() == 1) ||
-         (t->tgid() == debugged_tgid() &&
-          t->task_group()->task_set().size() == 1);
+Completion ReplaySession::patch_next_syscall(
+    ReplayTask* t, const StepConstraints& constraints) {
+  if (cont_syscall_boundary(t, constraints) == INCOMPLETE) {
+    return INCOMPLETE;
+  }
+
+  t->canonicalize_regs(t->arch());
+  t->exit_syscall_and_prepare_restart();
+
+  // All patching effects have been recorded to the trace.
+  // First, replay any memory mapping done by Monkeypatcher. There should be
+  // at most one but we might as well be general.
+  while (true) {
+    TraceReader::MappedData data;
+    bool found;
+    KernelMapping km = t->trace_reader().read_mapped_region(&data, &found);
+    if (!found) {
+      break;
+    }
+    AutoRemoteSyscalls remote(t);
+    ASSERT(t, km.flags() & MAP_ANONYMOUS);
+    remote.infallible_mmap_syscall(km.start(), km.size(), km.prot(),
+                                   km.flags() | MAP_FIXED, -1, 0);
+    t->vm()->map(t, km.start(), km.size(), km.prot(), km.flags(), 0, string(),
+                 KernelMapping::NO_DEVICE, KernelMapping::NO_INODE, nullptr,
+                 &km);
+    t->vm()->mapping_flags_of(km.start()) |=
+        AddressSpace::Mapping::IS_PATCH_STUBS;
+  }
+
+  // Now replay all data records.
+  t->apply_all_data_records_from_trace();
+  return COMPLETE;
 }
 
 /**
@@ -1302,34 +1275,142 @@ static bool has_deterministic_ticks(const Event& ev,
   return TSTEP_PROGRAM_ASYNC_SIGNAL_INTERRUPT != step.action;
 }
 
+void ReplaySession::check_approaching_ticks_target(
+    ReplayTask* t, const StepConstraints& constraints,
+    BreakStatus& break_status) {
+  if (constraints.ticks_target > 0) {
+    Ticks ticks_left = constraints.ticks_target - t->tick_count();
+    if (ticks_left <= PerfCounters::skid_size()) {
+      break_status.approaching_ticks_target = true;
+    }
+  }
+}
+
+Completion ReplaySession::advance_to_ticks_target(
+    ReplayTask* t, const StepConstraints& constraints) {
+  while (true) {
+    TicksRequest ticks_request;
+    if (!compute_ticks_request(t, constraints, &ticks_request)) {
+      return INCOMPLETE;
+    }
+    continue_or_step(t, constraints, ticks_request);
+    if (SIGTRAP == t->stop_sig()) {
+      return INCOMPLETE;
+    }
+  }
+}
+
 /**
  * Try to execute |step|, adjusting for |req| if needed.  Return COMPLETE if
  * |step| was made, or INCOMPLETE if there was a trap or |step| needs
  * more work.
  */
-Completion ReplaySession::try_one_trace_step(Task* t, RunCommand stepi) {
+Completion ReplaySession::try_one_trace_step(
+    ReplayTask* t, const StepConstraints& constraints) {
+  if (constraints.ticks_target > 0 && !trace_frame.event().has_ticks_slop() &&
+      t->current_trace_frame().ticks() > constraints.ticks_target) {
+    // Instead of doing this step, just advance to the ticks_target, since
+    // that happens before this event completes.
+    // Unfortunately we can't do this for TSTEP_FLUSH_SYSCALLBUF
+    // because its tick count can't be trusted.
+    // cont_syscall_boundary handles the ticks constraint for those cases.
+    return advance_to_ticks_target(t, constraints);
+  }
+
   switch (current_step.action) {
     case TSTEP_RETIRE:
       return COMPLETE;
     case TSTEP_ENTER_SYSCALL:
-      return enter_syscall(t, stepi);
+      return enter_syscall(t, constraints);
     case TSTEP_EXIT_SYSCALL:
-      return exit_syscall(t, stepi);
+      return exit_syscall(t);
     case TSTEP_DETERMINISTIC_SIGNAL:
-      return emulate_deterministic_signal(t, current_step.signo, stepi);
+      return emulate_deterministic_signal(t, current_step.target.signo,
+                                          constraints);
     case TSTEP_PROGRAM_ASYNC_SIGNAL_INTERRUPT:
-      return emulate_async_signal(t, current_step.target.signo, stepi,
-                                  current_step.target.ticks);
+      return emulate_async_signal(t, constraints, current_step.target.ticks);
     case TSTEP_DELIVER_SIGNAL:
-      return emulate_signal_delivery(t, current_step.signo);
+      return emulate_signal_delivery(t, current_step.target.signo);
     case TSTEP_FLUSH_SYSCALLBUF:
-      return flush_syscallbuf(t, stepi);
-    case TSTEP_DESCHED:
-      return skip_desched_ioctl(t, &current_step.desched, stepi);
+      return flush_syscallbuf(t, constraints);
+    case TSTEP_PATCH_SYSCALL:
+      return patch_next_syscall(t, constraints);
+    case TSTEP_EXIT_TASK:
+      return exit_task(t);
     default:
       FATAL() << "Unhandled step type " << current_step.action;
       return COMPLETE;
   }
+}
+
+/**
+ * Task death during replay always goes through here (except for
+ * Session::kill_all_tasks when we forcibly kill all tasks in the session at
+ * once). |exit| and |exit_group| syscalls are both emulated so the real
+ * task doesn't die until we reach the EXIT/UNSTABLE_EXIT events in the trace.
+ * This ensures the real tasks are alive and available as long as our Task
+ * object exists, which simplifies code like Session cloning.
+ *
+ * Killing tasks with fatal signals doesn't work because a fatal signal will
+ * try to kill all the tasks in the thread group. Instead we inject an |exit|
+ * syscall, which is apparently the only way to kill one specific thread.
+ */
+static void end_task(ReplayTask* t) {
+  ASSERT(t, t->ptrace_event() != PTRACE_EVENT_EXIT);
+
+  t->destroy_buffers();
+
+  Registers r = t->regs();
+  r.set_ip(t->vm()->privileged_traced_syscall_ip());
+  r.set_syscallno(syscall_number_for_exit(t->arch()));
+  t->set_regs(r);
+  // Enter the syscall.
+  t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_NO_TICKS);
+  ASSERT(t, t->ptrace_event() == PTRACE_EVENT_EXIT);
+
+  t->stable_exit = true;
+  t->destroy();
+}
+
+Completion ReplaySession::exit_task(ReplayTask* t) {
+  ASSERT(t, !t->seen_ptrace_exit_event);
+  // Apply robust-futex updates captured during recording.
+  t->apply_all_data_records_from_trace();
+  end_task(t);
+  /* |t| is dead now. */
+  return COMPLETE;
+}
+
+ReplayTask* ReplaySession::revive_task_for_exec() {
+  const Event& ev = trace_frame.event();
+  if (!ev.is_syscall_event() ||
+      !is_execve_syscall(ev.Syscall().number, ev.Syscall().arch())) {
+    FATAL() << "Can't find task, but we're not in an execve";
+  }
+
+  ThreadGroup* tg = nullptr;
+  for (auto& p : thread_group_map) {
+    if (p.second->tgid == trace_frame.tid()) {
+      tg = p.second;
+      break;
+    }
+  }
+  if (!tg) {
+    FATAL()
+        << "Dead task tid should be task-group leader, but we can't find it";
+  }
+  if (tg->task_set().size() != 1) {
+    FATAL() << "Should only be one task left in the taskgroup";
+  }
+
+  ReplayTask* t = static_cast<ReplayTask*>(*tg->task_set().begin());
+  LOG(debug) << "Changing task tid from " << t->rec_tid << " to "
+             << trace_frame.tid();
+  task_map.erase(t->rec_tid);
+  t->rec_tid = trace_frame.tid();
+  task_map.insert(make_pair(t->rec_tid, t));
+  // The real tid is not changing yet. It will, in process_execve.
+  return t;
 }
 
 /**
@@ -1340,21 +1421,26 @@ Completion ReplaySession::try_one_trace_step(Task* t, RunCommand stepi) {
  * requested a restart. If this returns false, t's Session state was not
  * modified.
  */
-void ReplaySession::setup_replay_one_trace_frame(Task* t) {
-  Event ev(trace_frame.event());
+ReplayTask* ReplaySession::setup_replay_one_trace_frame(ReplayTask* t) {
+  const Event& ev = trace_frame.event();
 
-  LOG(debug) << "[line " << trace_frame.time() << "] " << t->rec_tid
-             << ": replaying " << Event(ev) << "; state "
-             << state_name(trace_frame.event().state);
-  if (t->syscallbuf_hdr) {
-    LOG(debug) << "    (syscllbufsz:" << t->syscallbuf_hdr->num_rec_bytes
-               << ", abrtcmt:" << t->syscallbuf_hdr->abort_commit
-               << ", locked:" << t->syscallbuf_hdr->locked << ")";
+  if (!t) {
+    t = revive_task_for_exec();
   }
 
-  if (t->child_sig != 0) {
-    assert(EV_SIGNAL == ev.type() && t->child_sig == ev.Signal().number);
-    t->child_sig = 0;
+  LOG(debug) << "[event " << trace_frame.time() << "] " << t->rec_tid
+             << ": replaying " << Event(ev) << "; state "
+             << (ev.is_syscall_event() ? state_name(ev.Syscall().state)
+                                       : " (none)");
+  if (t->syscallbuf_child) {
+    LOG(debug) << "    (syscllbufsz:"
+               << (uint32_t)t->read_mem(
+                      REMOTE_PTR_FIELD(t->syscallbuf_child, num_rec_bytes))
+               << ", abrtcmt:" << bool(t->read_mem(REMOTE_PTR_FIELD(
+                                      t->syscallbuf_child, abort_commit)))
+               << ", locked:" << bool(t->read_mem(REMOTE_PTR_FIELD(
+                                     t->syscallbuf_child, locked)))
+               << ")";
   }
 
   /* Ask the trace-interpretation code what to do next in order
@@ -1362,179 +1448,234 @@ void ReplaySession::setup_replay_one_trace_frame(Task* t) {
   memset(&current_step, 0, sizeof(current_step));
 
   switch (ev.type()) {
-    case EV_UNSTABLE_EXIT:
-      t->unstable = true;
-    /* fall through */
-    case EV_EXIT: {
-      if (is_last_interesting_task(t)) {
-        LOG(debug) << "last interesting task in " << debugged_tgid() << " is "
-                   << t->rec_tid << " (" << t->tid << ")";
-        set_last_task(t);
-        return;
-      }
-
-      /* If the task was killed by a terminating signal,
-       * then it may have ended abruptly in a syscall or at
-       * some other random execution point.  That's bad for
-       * replay, because we detach from the task after we
-       * replay its "exit".  Since we emulate signal
-       * delivery, the task may happily carry on with
-       * (non-emulated!) execution after we detach.  That
-       * execution might include things like |rm -rf ~|.
-       *
-       * To ensure that the task really dies, we send it a
-       * terminating signal here.  One would like to use
-       * SIGKILL, but for not-understood reasons that causes
-       * shutdown hangs when joining the exited tracee.
-       * Other terminating signals have not been observed to
-       * hang, so that's what's used here.. */
-      syscall(SYS_tkill, t->tid, SIGABRT);
-      // TODO dissociate address space from file table
-      bool file_table_dying = (1 == t->vm()->task_set().size());
-      delete t;
-      /* Early-return because |t| is gone now. */
-      if (file_table_dying) {
-        gc_emufs();
-      }
-      return;
-    }
-    case EV_DESCHED:
-      current_step.action = TSTEP_DESCHED;
-      current_step.desched.type = ARMING_DESCHED_EVENT == ev.Desched().state
-                                      ? DESCHED_ARM
-                                      : DESCHED_DISARM;
-      current_step.desched.state = DESCHED_ENTER;
+    case EV_EXIT:
+      current_step.action = TSTEP_EXIT_TASK;
       break;
     case EV_SYSCALLBUF_ABORT_COMMIT:
-      t->syscallbuf_hdr->abort_commit = 1;
+      t->write_mem(REMOTE_PTR_FIELD(t->syscallbuf_child, abort_commit),
+                   (uint8_t)1);
+      t->apply_all_data_records_from_trace();
       current_step.action = TSTEP_RETIRE;
       break;
     case EV_SYSCALLBUF_FLUSH:
       current_step.action = TSTEP_FLUSH_SYSCALLBUF;
-      current_step.flush.need_buffer_restore = true;
-      current_step.flush.num_rec_bytes_remaining = 0;
+      prepare_syscallbuf_records(t);
       break;
     case EV_SYSCALLBUF_RESET:
-      t->syscallbuf_hdr->num_rec_bytes = 0;
+      // Reset syscallbuf_hdr->num_rec_bytes and zero out the recorded data.
+      // Zeroing out the data is important because we only save and restore
+      // the recorded data area when making checkpoints. We want the checkpoint
+      // to have the same syscallbuf contents as its original, i.e. zero outside
+      // the recorded data area. This is important because stray reads such
+      // as those performed by return_addresses should be consistent.
+      t->reset_syscallbuf();
       current_step.action = TSTEP_RETIRE;
+      break;
+    case EV_PATCH_SYSCALL:
+      current_step.action = TSTEP_PATCH_SYSCALL;
       break;
     case EV_SCHED:
       current_step.action = TSTEP_PROGRAM_ASYNC_SIGNAL_INTERRUPT;
       current_step.target.ticks = trace_frame.ticks();
       current_step.target.signo = 0;
       break;
-    case EV_SEGV_RDTSC:
+    case EV_INSTRUCTION_TRAP:
       current_step.action = TSTEP_DETERMINISTIC_SIGNAL;
-      current_step.signo = SIGSEGV;
+      current_step.target.ticks = -1;
+      current_step.target.signo = SIGSEGV;
       break;
-    case EV_INTERRUPTED_SYSCALL_NOT_RESTARTED:
-      LOG(debug) << "  popping interrupted but not restarted " << t->ev();
-      t->pop_syscall_interruption();
+    case EV_GROW_MAP:
+      process_grow_map(t);
       current_step.action = TSTEP_RETIRE;
       break;
-    case EV_EXIT_SIGHANDLER:
-      LOG(debug) << "<-- sigreturn from " << t->ev();
-      t->pop_signal_handler();
-      current_step.action = TSTEP_RETIRE;
-      break;
-    case EV_SIGNAL:
-      current_step.signo = ev.Signal().number;
-      current_step.action = ev.Signal().deterministic == DETERMINISTIC_SIG
-                                ? TSTEP_DETERMINISTIC_SIGNAL
-                                : TSTEP_PROGRAM_ASYNC_SIGNAL_INTERRUPT;
-      if (TSTEP_PROGRAM_ASYNC_SIGNAL_INTERRUPT == current_step.action) {
-        current_step.target.signo = current_step.signo;
+    case EV_SIGNAL: {
+      last_siginfo_ = ev.Signal().siginfo;
+      if (treat_signal_event_as_deterministic(ev.Signal())) {
+        current_step.action = TSTEP_DETERMINISTIC_SIGNAL;
+        current_step.target.signo = ev.Signal().siginfo.si_signo;
+        current_step.target.ticks = -1;
+      } else {
+        current_step.action = TSTEP_PROGRAM_ASYNC_SIGNAL_INTERRUPT;
+        current_step.target.signo = ev.Signal().siginfo.si_signo;
         current_step.target.ticks = trace_frame.ticks();
       }
       break;
+    }
+    case EV_SIGNAL_DELIVERY:
+    case EV_SIGNAL_HANDLER:
+      current_step.action = TSTEP_DELIVER_SIGNAL;
+      current_step.target.signo = ev.Signal().siginfo.si_signo;
+      break;
     case EV_SYSCALL:
-      rep_process_syscall(t, &current_step);
+      if (trace_frame.event().Syscall().state == ENTERING_SYSCALL ||
+          trace_frame.event().Syscall().state == ENTERING_SYSCALL_PTRACE) {
+        rep_prepare_run_to_syscall(t, &current_step);
+      } else {
+        rep_process_syscall(t, &current_step);
+        if (current_step.action == TSTEP_RETIRE) {
+          t->on_syscall_exit(current_step.syscall.number,
+                             current_step.syscall.arch, trace_frame.regs());
+        }
+      }
       break;
     default:
       FATAL() << "Unexpected event " << ev;
   }
+
+  return t;
 }
 
-ReplaySession::ReplayResult ReplaySession::replay_step(RunCommand command) {
-  ReplayResult result;
+bool ReplaySession::next_step_is_successful_syscall_exit(int syscallno) {
+  return current_step.action == TSTEP_NONE &&
+         trace_frame.event().is_syscall_event() &&
+         trace_frame.event().Syscall().number == syscallno &&
+         trace_frame.event().Syscall().state == EXITING_SYSCALL &&
+         !trace_frame.regs().syscall_failed();
+}
 
-  Task* t = current_task();
+ReplayResult ReplaySession::replay_step(const StepConstraints& constraints) {
+  finish_initializing();
 
-  if (EV_TRACE_TERMINATION == trace_frame.event().type) {
-    set_last_task(t);
+  ReplayResult result(REPLAY_CONTINUE);
+
+  ReplayTask* t = current_task();
+
+  if (EV_TRACE_TERMINATION == trace_frame.event().type()) {
     result.status = REPLAY_EXITED;
     return result;
   }
-
-  result.status = REPLAY_CONTINUE;
-  result.break_status.reason = BREAK_NONE;
 
   /* If we restored from a checkpoint, the steps might have been
    * computed already in which case step.action will not be TSTEP_NONE.
    */
   if (current_step.action == TSTEP_NONE) {
-    setup_replay_one_trace_frame(t);
+    t = setup_replay_one_trace_frame(t);
     if (current_step.action == TSTEP_NONE) {
       // Already at the destination event.
-      if (!last_task()) {
-        advance_to_next_trace_frame();
-      }
-      return result;
+      advance_to_next_trace_frame();
     }
+    if (current_step.action == TSTEP_EXIT_TASK) {
+      result.break_status.task = t;
+      result.break_status.task_exit = true;
+    }
+    return result;
   }
 
+  did_fast_forward = false;
+
+  // Now we know |t| hasn't died, so save it in break_status.
+  result.break_status.task = t;
+
   /* Advance towards fulfilling |current_step|. */
-  ReplayTraceStepType current_action = current_step.action;
-  if (try_one_trace_step(t, command) == INCOMPLETE) {
-    if (EV_TRACE_TERMINATION == trace_frame.event().type) {
+  if (try_one_trace_step(t, constraints) == INCOMPLETE) {
+    if (EV_TRACE_TERMINATION == trace_frame.event().type()) {
       // An irregular trace step had to read the
       // next trace frame, and that frame was an
       // early-termination marker.  Otherwise we
-      // would have seen the marker at
-      // |schedule_task()|.
-      set_last_task(t);
+      // would have seen the marker above.
       result.status = REPLAY_EXITED;
       return result;
     }
 
-    // We got INCOMPLETE because there was some kind of debugger trap.
-    if (current_step.action != current_action &&
-        current_step.action == TSTEP_DELIVER_SIGNAL) {
-      result.break_status.reason = BREAK_SIGNAL;
-      result.break_status.task = t;
-      result.break_status.signal = current_step.signo;
-    } else {
-      result.break_status = diagnose_debugger_trap(t, t->child_sig);
-      ASSERT(t, result.break_status.reason != BREAK_SIGNAL)
-          << "Expected either SIGTRAP at $ip " << t->ip()
-          << " or USER breakpoint just after it";
-      ASSERT(t, result.break_status.reason != BREAK_SINGLESTEP ||
-                    command == RUN_SINGLESTEP);
-    }
+    // We got INCOMPLETE because there was some kind of debugger trap or
+    // we got close to ticks_target.
+    result.break_status = diagnose_debugger_trap(t, constraints.command);
+    ASSERT(t, !result.break_status.signal)
+        << "Expected either SIGTRAP at $ip " << t->ip()
+        << " or USER breakpoint just after it";
+    ASSERT(t,
+           !result.break_status.singlestep_complete ||
+               constraints.is_singlestep());
 
-    /* Don't restart with SIGTRAP anywhere. */
-    t->child_sig = 0;
+    check_approaching_ticks_target(t, constraints, result.break_status);
+    result.did_fast_forward = did_fast_forward;
     return result;
   }
 
-  if (TSTEP_ENTER_SYSCALL == current_step.action) {
-    rep_after_enter_syscall(t, current_step.syscall.number);
-    cpuid_bug_detector.notify_reached_syscall_during_replay(t);
-  }
-  if (can_validate() && SYSCALL_EXIT == trace_frame.event().state &&
-      Flags::get().check_cached_mmaps) {
-    t->vm()->verify(t);
+  result.did_fast_forward = did_fast_forward;
+
+  switch (current_step.action) {
+    case TSTEP_DETERMINISTIC_SIGNAL:
+    case TSTEP_PROGRAM_ASYNC_SIGNAL_INTERRUPT:
+      if (current_step.target.signo) {
+        if (trace_frame.event().type() != EV_INSTRUCTION_TRAP) {
+          ASSERT(t, current_step.target.signo == last_siginfo_.si_signo);
+          result.break_status.signal =
+              unique_ptr<siginfo_t>(new siginfo_t(last_siginfo_));
+        }
+        if (constraints.is_singlestep()) {
+          result.break_status.singlestep_complete = true;
+        }
+      }
+      break;
+    case TSTEP_DELIVER_SIGNAL:
+      // When we deliver a terminating signal, do not let the singlestep
+      // complete; proceed on to report our synthetic SIGKILL or task death.
+      if (constraints.is_singlestep() &&
+          !(trace_frame.event().type() == EV_SIGNAL_DELIVERY &&
+            is_fatal_default_action(current_step.target.signo))) {
+        result.break_status.singlestep_complete = true;
+      }
+      break;
+    case TSTEP_EXIT_TASK:
+      result.break_status.task = nullptr;
+      t = nullptr;
+      DEBUG_ASSERT(!result.break_status.any_break());
+      break;
+    case TSTEP_ENTER_SYSCALL:
+      cpuid_bug_detector.notify_reached_syscall_during_replay(t);
+      break;
+    case TSTEP_EXIT_SYSCALL:
+      if (constraints.is_singlestep()) {
+        result.break_status.singlestep_complete = true;
+      }
+      break;
+    default:
+      break;
   }
 
-  Event ev(trace_frame.event());
-  if (has_deterministic_ticks(ev, current_step)) {
-    check_ticks_consistency(t, ev);
+  if (t) {
+    const Event& ev = trace_frame.event();
+    if (done_initial_exec() && ev.is_syscall_event() &&
+        rr::Flags::get().check_cached_mmaps) {
+      t->vm()->verify(t);
+    }
+
+    if (has_deterministic_ticks(ev, current_step)) {
+      check_ticks_consistency(t, ev);
+    }
+
+    debug_memory(t);
+
+    check_for_watchpoint_changes(t, result.break_status);
+    check_approaching_ticks_target(t, constraints, result.break_status);
   }
 
-  debug_memory(t);
-
+  advance_to_next_trace_frame();
   // Record that this step completed successfully.
   current_step.action = TSTEP_NONE;
-  advance_to_next_trace_frame();
+
+  ReplayTask* next_task = current_task();
+  if (next_task && !next_task->vm()->first_run_event() && done_initial_exec()) {
+    next_task->vm()->set_first_run_event(trace_frame.time());
+  }
+  if (next_task) {
+    ticks_at_start_of_event = next_task->tick_count();
+  }
+
   return result;
 }
+
+ReplayTask* ReplaySession::find_task(pid_t rec_tid) const {
+  return static_cast<ReplayTask*>(Session::find_task(rec_tid));
+}
+
+ReplayTask* ReplaySession::find_task(const TaskUid& tuid) const {
+  return static_cast<ReplayTask*>(Session::find_task(tuid));
+}
+
+double ReplaySession::get_trace_start_time(){
+  return trace_start_time;
+}
+
+} // namespace rr

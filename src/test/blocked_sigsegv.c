@@ -1,26 +1,30 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-static void fault_handler(int sig, siginfo_t* si, void* context) {
+static void fault_handler(__attribute__((unused)) int sig,
+                          __attribute__((unused)) siginfo_t* si,
+                          __attribute__((unused)) void* context) {
   atomic_puts("FAILED: handler should not have been called for blocked signal");
 }
 
-static void* start_thread(void* p) {
+static void* start_thread(__attribute__((unused)) void* p) {
   sigset_t s;
 
   sigemptyset(&s);
   sigaddset(&s, SIGSEGV);
   sigprocmask(SIG_BLOCK, &s, NULL);
 
+  rdtsc();
+
   atomic_puts("EXIT-SUCCESS");
 
-  *(int*)NULL = 0;
+  crash_null_deref();
 
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   struct sigaction act;
   pthread_t thread;
 

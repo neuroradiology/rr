@@ -1,9 +1,9 @@
-from rrutil import *
+from util import *
 
-send_gdb('c\n')
+send_gdb('c')
 expect_gdb('exited normally')
 
-restart_replay_at_end()
+restart_replay()
 
 expect_gdb('exited normally')
 

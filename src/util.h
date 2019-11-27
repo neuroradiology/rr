@@ -3,76 +3,51 @@
 #ifndef RR_UTIL_H_
 #define RR_UTIL_H_
 
-#include <errno.h>
-#include <fcntl.h>
-#include <limits.h>
 #include <signal.h>
-#include <stddef.h>
 #include <stdio.h>
-#include <string.h>
-#include <sys/ptrace.h>
-#include <unistd.h>
 
 #include <array>
-#include <ostream>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 
-#include "Event.h"
-#include "ExtraRegisters.h"
-#include "kernel_abi.h"
-#include "kernel_supplement.h"
-#include "Registers.h"
 #include "ScopedFd.h"
+#include "TraceFrame.h"
+#include "remote_ptr.h"
 
-class AutoRemoteSyscalls;
+/* This is pretty arbitrary. On Linux SIGPWR is sent to PID 1 (init) on
+ * power failure, and it's unlikely rr will be recording that.
+ * Note that SIGUNUSED means SIGSYS which actually *is* used (by seccomp),
+ * so we can't use it. */
+#define SYSCALLBUF_DEFAULT_DESCHED_SIGNAL SIGPWR
+
+namespace rr {
+
+/*
+ * This file is a dumping ground for functionality that needs to be shared but
+ * has no other obvious place to go.
+ *
+ * We should minimize the amount of code here. Code that's only needed in one
+ * place can move out of this file.
+ */
+
+struct Event;
+class KernelMapping;
 class Task;
 class TraceFrame;
-struct Flags;
 
-template <typename T, size_t N> constexpr size_t array_length(T (&array)[N]) {
-  return N;
-}
-
-template <typename T, size_t N>
-constexpr size_t array_length(std::array<T, N>& array) {
-  return N;
-}
-
-#define SHMEM_FS "/dev/shm"
-#define SHMEM_FS2 "/run/shm"
-
-/* The syscallbuf shared with tracees is created with this prefix
- * followed by the tracee tid, then immediately unlinked and shared
- * anonymously. */
-#define SYSCALLBUF_SHMEM_NAME_PREFIX "rr-tracee-shmem-"
-#define SYSCALLBUF_SHMEM_PATH_PREFIX SHMEM_FS "/" SYSCALLBUF_SHMEM_NAME_PREFIX
-
-#define PREFIX_FOR_EMPTY_MMAPED_REGIONS "/tmp/rr-emptyfile-"
-
-class Task;
-
-enum Completion {
-  COMPLETE,
-  INCOMPLETE
-};
+enum Completion { COMPLETE, INCOMPLETE };
 
 /**
- * Return true if |reg1| matches |reg2|.  Passing EXPECT_MISMATCHES
- * indicates that the caller is using this as a general register
- * compare and nothing special should be done if the register files
- * mismatch.  Passing LOG_MISMATCHES will log the registers that don't
- * match.  Passing BAIL_ON_MISMATCH will additionally abort on
- * mismatch.
+ * Returns a vector containing the raw data you can get from getauxval.
  */
-enum {
-  EXPECT_MISMATCHES = 0,
-  LOG_MISMATCHES,
-  BAIL_ON_MISMATCH
-};
-bool compare_register_files(Task* t, const char* name1, const Registers& reg1,
-                            const char* name2, const Registers& reg2,
-                            int mismatch_behavior);
+std::vector<uint8_t> read_auxv(Task* t);
 
-void assert_child_regs_are(Task* t, const Registers& regs);
+/**
+ * Returns a vector containing the environment strings.
+ */
+std::vector<std::string> read_env(Task* t);
 
 /**
  * Create a file named |filename| and dump |buf_len| words in |buf| to
@@ -89,65 +64,40 @@ void dump_binary_data(const char* filename, const char* label,
  * Format a suitable filename within the trace directory for dumping
  * information about |t| at the current global time, to a file that
  * contains |tag|.  The constructed filename is returned through
- * |filename|.  For example, a filename for a task with tid 12345 at
+ * |filename|.  For example, a filengit logame for a task with tid 12345 at
  * time 111, for a file tagged "foo", would be something like
  * "trace_0/12345_111_foo".  The returned name is not guaranteed to be
  * unique, caveat emptor.
  */
-void format_dump_filename(Task* t, int global_time, const char* tag,
+void format_dump_filename(Task* t, FrameTime global_time, const char* tag,
                           char* filename, size_t filename_size);
 
 /**
- * Return true if the user requested memory be dumped for |t| at
- * |event| at |global_time|.
+ * Return true if the user requested memory be dumped at this event/time.
  */
-bool should_dump_memory(Task* t, const TraceFrame& f);
+bool should_dump_memory(const Event& event, FrameTime time);
 /**
  * Dump all of the memory in |t|'s address to the file
  * "[trace_dir]/[t->tid]_[global_time]_[tag]".
  */
-void dump_process_memory(Task* t, int global_time, const char* tag);
+void dump_process_memory(Task* t, FrameTime global_time, const char* tag);
 
 /**
  * Return true if the user has requested |t|'s memory be
- * checksummed at |event| at |global_time|.
+ * checksummed at this event/time.
  */
-bool should_checksum(Task* t, const TraceFrame& f);
+bool should_checksum(const Event& event, FrameTime time);
 /**
  * Write a checksum of each mapped region in |t|'s address space to a
  * special log, where it can be read by |validate_process_memory()|
  * during replay.
  */
-void checksum_process_memory(Task* t, int global_time);
+void checksum_process_memory(Task* t, FrameTime global_time);
 /**
  * Validate the checksum of |t|'s address space that was written
  * during recording.
  */
-void validate_process_memory(Task* t, int global_time);
-
-/**
- * Open a temporary debugging connection for |t| and service requests
- * until the user quits or requests execution to resume.
- *
- * You probably don't want to use this directly; instead, use
- * |assert_exec()| from dbg.h.
- *
- * This function does not return.
- */
-void emergency_debug(Task* t);
-
-/**
- * Get the current time from the preferred monotonic clock in units of
- * seconds, relative to an unspecific point in the past.
- */
-double now_sec(void);
-
-/**
- * Sleep for the duration of time specified in |ts|.  Continue
- * sleeping until |ts| has elapsed, even if a signal is received.  If
- * an error occurs, -1 is returned and errno is set appropriately.
- */
-void nanosleep_nointr(const struct timespec* ts);
+void validate_process_memory(Task* t, FrameTime global_time);
 
 /**
  * Return nonzero if the rr session is probably not interactive (that
@@ -155,38 +105,6 @@ void nanosleep_nointr(const struct timespec* ts);
  * so asking for user input or other actions is probably pointless.
  */
 bool probably_not_interactive(int fd = STDERR_FILENO);
-
-/**
- * If |child_fd| is a stdio fd and stdio-marking is enabled, prepend
- * the stdio write with "[rr.<global-time>]".  This allows users to
- * more easily correlate stdio with trace event numbers.
- */
-void maybe_mark_stdio_write(Task* t, int child_fd);
-
-/**
- * Return the symbolic name of the PTRACE_EVENT_* |event|, or
- * "???EVENT" if unknown.
- */
-const char* ptrace_event_name(int event);
-
-/**
- * Return the symbolic name of the PTRACE_ |request|, or "???REQ" if
- * unknown.
- */
-const char* ptrace_req_name(int request);
-
-/**
- * Return the symbolic name of |sig|, f.e. "SIGILL", or "???signal" if
- * unknown.
- */
-const char* signalname(int sig);
-
-/**
- * Return true iff replaying |syscall| will never ever require
- * actually executing it, i.e. replay of |syscall| is always
- * emulated.
- */
-bool is_always_emulated_syscall(int syscall, SupportedArch arch);
 
 /**
  * Convert the flags passed to the clone() syscall, |flags_arg|, into
@@ -201,92 +119,53 @@ int clone_flags_to_task_flags(int flags_arg);
 size_t ceil_page_size(size_t sz);
 remote_ptr<void> ceil_page_size(remote_ptr<void> addr);
 
+/**
+ * Return the argument rounded down to the nearest multiple of the
+ * system |page_size()|.
+ */
+size_t floor_page_size(size_t sz);
+remote_ptr<void> floor_page_size(remote_ptr<void> addr);
+
 /** Return the system page size. */
 size_t page_size();
 
-/**
- * Copy the registers used for syscall arguments (not including
- * syscall number) from |from| to |to|.
- */
-void copy_syscall_arg_regs(Registers* to, const Registers& from);
-
-/**
- * Return true if a FUTEX_LOCK_PI operation on |futex| done by |t|
- * will transition the futex into the contended state.  (This results
- * in the kernel atomically setting the FUTEX_WAITERS bit on the futex
- * value.)  The new value of the futex after the kernel updates it is
- * returned in |next_val|.
- */
-bool is_now_contended_pi_futex(Task* t, remote_ptr<int> futex, int* next_val);
-
 /** Return the default action of |sig|. */
-enum signal_action {
-  DUMP_CORE,
-  TERMINATE,
-  CONTINUE,
-  STOP,
-  IGNORE
-};
+enum signal_action { DUMP_CORE, TERMINATE, CONTINUE, STOP, IGNORE };
 signal_action default_action(int sig);
 
-/**
- * Return true if |sig| may cause the status of other tasks to change
- * unpredictably beyond rr's observation.
- * 'deterministic' is true when the signal was delivered deterministically,
- * i.e. due to code execution as opposed to an asynchronous signal sent by some
- * process.
- */
-bool possibly_destabilizing_signal(Task* t, int sig,
-                                   SignalDeterministic deterministic);
+SignalDeterministic is_deterministic_signal(Task* t);
 
 /**
- * Return nonzero if a mapping of |filename| with metadata |stat|,
- * using |flags| and |prot|, should almost certainly be copied to
+ * Return nonzero if a mapping of |mapping| should almost certainly be copied to
  * trace; i.e., the file contents are likely to change in the interval
  * between recording and replay.  Zero is returned /if we think we can
  * get away/ with not copying the region.  That doesn't mean it's
  * necessarily safe to skip copying!
  */
-enum {
-  DONT_WARN_SHARED_WRITEABLE = 0,
-  WARN_DEFAULT
-};
-bool should_copy_mmap_region(const char* filename, const struct stat* stat,
-                             int prot, int flags, int warn_shared_writeable);
-
-/**
- * Return an fd referring to a new shmem segment with descriptive
- * |name| of size |num_bytes|.
- */
-ScopedFd create_shmem_segment(const char* name, size_t num_bytes);
+bool should_copy_mmap_region(const KernelMapping& mapping,
+                             const struct stat& stat);
 
 /**
  * Ensure that the shmem segment referred to by |fd| has exactly the
  * size |num_bytes|.
  */
-void resize_shmem_segment(ScopedFd& fd, size_t num_bytes);
-
-/**
- * At thread exit time, undo the work that init_buffers() did.
- *
- * Call this when the tracee has already entered SYS_exit. The
- * tracee will be returned at a state in which it has entered (or
- * re-entered) SYS_exit.
- */
-void destroy_buffers(Task* t);
-
-/**
- * Locate |t|'s |__kernel_vsyscall()| helper and then monkey-patch it
- * to jump to the preload lib's hook function.
- */
-void monkeypatch_vdso(Task* t);
+void resize_shmem_segment(ScopedFd& fd, uint64_t num_bytes);
 
 enum cpuid_requests {
   CPUID_GETVENDORSTRING,
   CPUID_GETFEATURES,
   CPUID_GETTLB,
   CPUID_GETSERIAL,
+  CPUID_GETCACHEPARAMS = 0x04,
+  CPUID_GETEXTENDEDFEATURES = 0x07,
+  CPUID_GETEXTENDEDTOPOLOGY = 0x0B,
   CPUID_GETXSAVE = 0x0D,
+  CPUID_GETRDTMONITORING = 0x0F,
+  CPUID_GETRDTALLOCATION = 0x10,
+  CPUID_GETSGX = 0x12,
+  CPUID_GETPT = 0x14,
+  CPUID_GETSOC = 0x17,
+  CPUID_HYPERVISOR = 0x40000000,
   CPUID_INTELEXTENDED = 0x80000000,
   CPUID_INTELFEATURES,
   CPUID_INTELBRANDSTRING,
@@ -294,32 +173,289 @@ enum cpuid_requests {
   CPUID_INTELBRANDSTRINGEND,
 };
 
+const int OSXSAVE_FEATURE_FLAG = 1 << 27;
+const int AVX_FEATURE_FLAG = 1 << 28;
+const int HLE_FEATURE_FLAG = 1 << 4;
+const int XSAVEC_FEATURE_FLAG = 1 << 1;
+
 /** issue a single request to CPUID. Fits 'intel features', for instance
  *  note that even if only "eax" and "edx" are of interest, other registers
  *  will be modified by the operation, so we need to tell the compiler about it.
  *  'code' is placed in EAX. 'subrequest' is placed in ECX.
  *  *a, *c and *d receive EAX, ECX and EDX respectively.
  */
-void cpuid(int code, int subrequest, unsigned int* a, unsigned int* c,
-           unsigned int* d);
+struct CPUIDData {
+  uint32_t eax, ebx, ecx, edx;
+};
+CPUIDData cpuid(uint32_t code, uint32_t subrequest);
 
 /**
- * Force this process (and its descendants) to only use the cpu with the given
- * index.
+ * Check OSXSAVE flag.
  */
-void set_cpu_affinity(int cpu);
+bool xsave_enabled();
+/**
+ * Fetch current XCR0 value using XGETBV instruction.
+ */
+uint64_t xcr0();
 
 /**
- * Return the number of available CPUs in the system.
+ * Return all CPUID values supported by this CPU.
  */
-int get_num_cpus();
+struct CPUIDRecord {
+  uint32_t eax_in;
+  // UINT32_MAX means ECX not relevant
+  uint32_t ecx_in;
+  CPUIDData out;
+};
+std::vector<CPUIDRecord> all_cpuid_records();
 
+/**
+ * Returns true if CPUID faulting is supported by the kernel and hardware and
+ * is actually working.
+ */
+bool cpuid_faulting_works();
+
+/**
+ * Locate a CPUID record for the give parameters, or return nullptr if there
+ * isn't one.
+ */
+const CPUIDRecord* find_cpuid_record(const std::vector<CPUIDRecord>& records,
+                                     uint32_t eax, uint32_t ecx);
+
+/**
+ * Return true if the trace's CPUID values are "compatible enough" with our
+ * CPU's CPUID values.
+ */
+bool cpuid_compatible(const std::vector<CPUIDRecord>& trace_records);
+
+struct CloneParameters {
+  remote_ptr<void> stack;
+  remote_ptr<int> ptid;
+  remote_ptr<void> tls;
+  remote_ptr<int> ctid;
+};
 /**
  * Extract various clone(2) parameters out of the given Task's registers.
- * Each remote_ptr parameter may be nullptr.
  */
-void extract_clone_parameters(Task* t, remote_ptr<void>* stack,
-                              remote_ptr<int>* ptid, remote_ptr<void>* tls,
-                              remote_ptr<int>* ctid);
+CloneParameters extract_clone_parameters(Task* t);
+
+/**
+ * Read the ELF CLASS from the given filename. If it's unable to be read,
+ * return ELFCLASSNONE. If it's not an ELF file, return NOT_ELF.
+ */
+const int NOT_ELF = 0x10000;
+int read_elf_class(const std::string& filename);
+
+bool trace_instructions_up_to_event(FrameTime event);
+
+/* Helpful for broken debuggers */
+
+void dump_task_set(const std::set<Task*>& tasks);
+
+void dump_task_map(const std::map<pid_t, Task*>& tasks);
+
+std::string real_path(const std::string& path);
+
+std::string resource_path();
+
+/**
+ * Get the current time from the preferred monotonic clock in units of
+ * seconds, relative to an unspecific point in the past.
+ */
+double monotonic_now_sec();
+
+bool running_under_rr();
+
+std::vector<std::string> read_proc_status_fields(pid_t tid, const char* name,
+                                                 const char* name2 = nullptr,
+                                                 const char* name3 = nullptr);
+
+bool is_zombie_process(pid_t pid);
+
+/**
+ * Mainline Linux kernels use an invisible (to /proc/<pid>/maps) guard page
+ * for stacks. grsecurity kernels don't.
+ */
+bool uses_invisible_guard_page();
+
+bool copy_file(int dest_fd, int src_fd);
+
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+extern "C" void __msan_unpoison(void*, size_t);
+inline void msan_unpoison(void* ptr, size_t n) { __msan_unpoison(ptr, n); };
+#else
+inline void msan_unpoison(void* ptr, size_t n) {
+  (void)ptr;
+  (void)n;
+};
+#endif
+#else
+inline void msan_unpoison(void* ptr, size_t n) {
+  (void)ptr;
+  (void)n;
+};
+#endif
+
+/**
+ * Determine if the given capabilities are a subset of the process' current
+ * active capabilities.
+ */
+bool has_effective_caps(uint64_t caps);
+
+struct XSaveFeatureLayout {
+  uint32_t offset;
+  uint32_t size;
+};
+
+struct XSaveLayout {
+  size_t full_size;
+  uint64_t supported_feature_bits;
+  std::vector<XSaveFeatureLayout> feature_layouts;
+};
+
+/**
+ * Determine the layout of the native XSAVE area
+ */
+const XSaveLayout& xsave_native_layout();
+
+/**
+ * Determine the layout of the XSAVE area from a trace
+ */
+XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records);
+
+/**
+ * 0 means XSAVE not detected
+ */
+inline size_t xsave_area_size() { return xsave_native_layout().full_size; }
+
+inline sig_set_t signal_bit(int sig) { return sig_set_t(1) << (sig - 1); }
+
+inline bool is_kernel_trap(int si_code) {
+  /* XXX unable to find docs on which of these "should" be
+   * right.  The SI_KERNEL code is seen in the int3 test, so we
+   * at least need to handle that. */
+  return si_code == TRAP_BRKPT || si_code == SI_KERNEL;
+}
+
+enum ProbePort { DONT_PROBE = 0, PROBE_PORT };
+
+ScopedFd open_socket(const char* address, unsigned short* port,
+                     ProbePort probe);
+
+/**
+ * Like `abort`, but tries to wake up test-monitor for a snapshot if possible.
+ */
+void notifying_abort();
+
+/**
+ * Dump the current rr stack
+ */
+void dump_rr_stack();
+
+/**
+ * Check for leaked mappings etc
+ */
+void check_for_leaks();
+
+/**
+ * Create directory `str`, creating parent directories as needed.
+ * `dir_type` is printed in error messages. Fails if the resulting directory
+ * is not writeable.
+ */
+void ensure_dir(const std::string& dir, const char* dir_type, mode_t mode);
+
+/**
+ * Returns $TMPDIR or "/tmp". We call ensure_dir to make sure the directory
+ * exists and is writeable.
+ */
+const char* tmp_dir();
+
+struct TempFile {
+  std::string name;
+  ScopedFd fd;
+};
+
+/**
+ * `pattern is an mkstemp pattern minus any leading path. We'll choose the
+ * temp directory ourselves. The file is not automatically deleted, the caller
+ * must take care of that.
+ */
+TempFile create_temporary_file(const char* pattern);
+
+void good_random(void* out, size_t out_len);
+
+std::vector<std::string> current_env();
+
+int get_num_cpus();
+
+enum class TrappedInstruction {
+  NONE = 0,
+  RDTSC = 1,
+  RDTSCP = 2,
+  CPUID = 3,
+  INT3 = 4,
+};
+
+/* If |t->ip()| points at a disabled instruction, return the instruction */
+TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip);
+
+/* Return the length of the TrappedInstruction */
+size_t trapped_instruction_len(TrappedInstruction insn);
+
+/**
+ * BIND_CPU means binding to a randomly chosen CPU.
+ * UNBOUND_CPU means not binding to a particular CPU.
+ * A non-negative value means binding to the specific CPU number.
+ */
+enum BindCPU { BIND_CPU = -2, UNBOUND_CPU = -1 };
+
+/* Convert a BindCPU to a specific CPU number */
+int choose_cpu(BindCPU bind_cpu);
+
+/* Updates an IEEE 802.3 CRC-32 least significant bit first from each byte in
+ * |buf|.  Pre- and post-conditioning is not performed in this function and so
+ * should be performed by the caller, as required. */
+uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len);
+
+/* Like write(2) but any error or "device full" is treated as fatal. We also
+ * ensure that all bytes are written by looping on short writes. */
+void write_all(int fd, const void* buf, size_t size);
+
+/* Like pwrite64(2) but we try to write all bytes by looping on short writes. */
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset);
+
+/* Returns true if |path| is an accessible directory. Returns false if there
+ * was an error.
+ */
+bool is_directory(const char* path);
+
+/**
+ * Read bytes from `fd` into `buf` from `offset` until the read returns an
+ * error or 0 or the buffer is full. Returns total bytes read or -1 for error.
+ */
+ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size);
+
+/**
+ * Raise resource limits, in particular the open file descriptor count.
+ */
+void raise_resource_limits();
+
+/**
+ * Restore the initial resource limits for this process.
+ */
+void restore_initial_resource_limits();
+
+/**
+ * Return the word size for the architecture.
+ */
+size_t word_size(SupportedArch arch);
+
+/**
+ * Print JSON-escaped version of the string, including double-quotes.
+ */
+std::string json_escape(const std::string& str, size_t pos = 0);
+
+} // namespace rr
 
 #endif /* RR_UTIL_H_ */

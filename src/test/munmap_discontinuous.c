@@ -1,10 +1,10 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 #define TEST_FILE "foo.txt"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   size_t page_size = sysconf(_SC_PAGESIZE);
   int fd = open(TEST_FILE, O_CREAT | O_EXCL | O_RDWR, 0600);
   uint8_t* pages;

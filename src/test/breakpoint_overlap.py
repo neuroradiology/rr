@@ -1,17 +1,17 @@
 import collections
 import sys
 import re
-from rrutil import *
+from util import *
 
 arch = get_exe_arch()
 
-ArchInfo = collections.namedtuple('ArchInfo', ['syscall', 'ip_name'])
+ArchInfo = collections.namedtuple('ArchInfo', ['ip_name'])
 regex_info = {
-    'i386': ArchInfo('getgid32', 'eip'),
-    'i386:x86-64': ArchInfo('getgid', 'rip'),
+    'i386': ArchInfo('eip'),
+    'i386:x86-64': ArchInfo('rip'),
 }
 
-syscall_re = re.compile("`SYSCALL: %s' \\(state:1\\)" % regex_info[arch].syscall)
+syscall_re = re.compile("`SYSCALL: <unknown-syscall--1>' \\(state:EXITING_SYSCALL\\)")
 sched_re = re.compile("`SCHED'")
 eip_re = re.compile("%s:(0x[a-f0-9]+)" % regex_info[arch].ip_name)
 
@@ -35,14 +35,21 @@ while True:
 if eip is None:
     failed('%s not found' % regex_info[arch].ip_name)
 
-send_gdb('b *%s\n'%eip)
+# The SCHED after getgid may land in libc, which might not be loaded yet, in
+# which case setting a breakpoint there will cause gdb to barf. So run to
+# 'main' at which point libc is definitely loaded.
+send_gdb('b main')
+expect_gdb('Breakpoint 1')
+send_gdb('c')
 expect_gdb('Breakpoint 1')
 
-send_gdb('c\n')
-expect_gdb('Breakpoint 1')
-expect_gdb('(gdb)')
+send_gdb('b *%s'%eip)
+expect_gdb('Breakpoint 2')
+send_gdb('c')
+expect_gdb('Breakpoint 2')
+expect_gdb('(rr)')
 
-send_gdb('p/x *(char*)$pc\n')
+send_gdb('p/x *(char*)$pc')
 expect_gdb('0x([a-f0-9]+)')
 
 if last_match().group(1) is 'cc':

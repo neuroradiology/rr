@@ -1,8 +1,8 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   int fd = timerfd_create(CLOCK_MONOTONIC, 0);
   struct itimerspec spec, old;
   uint64_t num_expirations;

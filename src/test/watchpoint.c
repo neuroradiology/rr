@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static void breakpoint(void) {
   int break_here = 1;
@@ -9,12 +9,12 @@ static void breakpoint(void) {
 
 static int var;
 
-static void* thread(void* unused) {
+static void* thread(__attribute__((unused)) void* unused) {
   var = 1337;
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   pthread_t t;
 
   breakpoint();

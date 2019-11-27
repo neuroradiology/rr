@@ -1,10 +1,10 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 extern int cpuid_loop(int iterations);
 
-int main(int argc, char** argv) {
+int main(void) {
   int sum;
   getegid();
   sum = cpuid_loop(1000);

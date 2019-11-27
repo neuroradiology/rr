@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 static int num_its;
 
@@ -30,7 +30,7 @@ static void unblock_signals(void) {
   atomic_printf("  %d: unblocked all sigs\n", sys_gettid());
 }
 
-static void* thread(void* unused) {
+static void* thread(__attribute__((unused)) void* unused) {
   unblock_signals();
   syscall_spam();
   return NULL;

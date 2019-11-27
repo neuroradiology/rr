@@ -1,17 +1,17 @@
 /* -*- Mode: C; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "rrutil.h"
+#include "util.h"
 
 long int counter = 0;
 pthread_barrier_t bar;
 
-void catcher(int sig) {
+void catcher(__attribute__((unused)) int sig) {
   atomic_printf("Signal caught, Counter is %ld\n", counter);
   atomic_puts("EXIT-SUCCESS");
   _exit(0);
 }
 
-void* receiver(void* name) {
+void* receiver(__attribute__((unused)) void* name) {
   struct sigaction sact;
 
   sigemptyset(&sact.sa_mask);
