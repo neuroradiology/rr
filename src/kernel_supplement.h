@@ -3,14 +3,18 @@
 #ifndef RR_KERNEL_SUPPLEMENT_H_
 #define RR_KERNEL_SUPPLEMENT_H_
 
+#define _GNU_SOURCE 1
+
 #include <linux/if_tun.h>
 #include <linux/mman.h>
 #include <linux/seccomp.h>
 #include <linux/usbdevice_fs.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/ptrace.h>
+#include <sys/wait.h>
 
 namespace rr {
 
@@ -27,27 +31,21 @@ namespace rr {
 #define PTRACE_EVENT_STOP 128
 #endif
 
-#ifndef PTRACE_OLDSETOPTIONS
-#define PTRACE_OLDSETOPTIONS 21
+#ifndef PTRACE_GETREGSET
+#define PTRACE_GETREGSET 0x4204
+#endif
+#ifndef PTRACE_SETREGSET
+#define PTRACE_SETREGSET 0x4205
 #endif
 
-#ifndef PTRACE_GET_THREAD_AREA
-#define PTRACE_GET_THREAD_AREA 25
+#ifndef PTRACE_SEIZE
+#define PTRACE_SEIZE 0x4206
 #endif
-
-#ifndef PTRACE_SET_THREAD_AREA
-#define PTRACE_SET_THREAD_AREA 26
+#ifndef PTRACE_INTERRUPT
+#define PTRACE_INTERRUPT 0x4207
 #endif
-
-#ifndef PTRACE_ARCH_PRCTL
-#define PTRACE_ARCH_PRCTL 30
-#endif
-
-#ifndef PTRACE_SYSEMU
-#define PTRACE_SYSEMU 31
-#endif
-#ifndef PTRACE_SYSEMU_SINGLESTEP
-#define PTRACE_SYSEMU_SINGLESTEP 32
+#ifndef PTRACE_LISTEN
+#define PTRACE_LISTEN	0x4208
 #endif
 
 #ifndef PTRACE_GETSIGMASK
@@ -87,6 +85,18 @@ namespace rr {
 #endif
 #ifndef PR_SET_SPECULATION_CTRL
 #define PR_SET_SPECULATION_CTRL 53
+#endif
+
+// This is used on AArch64 and available in linux/signal.h, but
+// including that header will conflict with a number of our
+// struct definitions.
+#ifndef TRAP_HWBKPT
+#define TRAP_HWBKPT 4
+#endif
+
+// This is used on AArch64 and not available on CentOS 7.8
+#ifndef NT_ARM_SYSTEM_CALL
+#define NT_ARM_SYSTEM_CALL 0x404
 #endif
 
 // These are defined by the include/linux/errno.h in the kernel tree.
@@ -194,6 +204,12 @@ struct rr_input_mask {
 #endif
 #ifndef MADV_DODUMP
 #define MADV_DODUMP 17
+#endif
+#ifndef MADV_WIPEONFORK
+#define MADV_WIPEONFORK 18
+#endif
+#ifndef MADV_KEEPONFORK
+#define MADV_KEEPONFORK 19
 #endif
 #ifndef MADV_SOFT_OFFLINE
 #define MADV_SOFT_OFFLINE 101
@@ -306,6 +322,22 @@ struct rr_input_mask {
 #ifndef CLONE_NEWCGROUP
 #define CLONE_NEWCGROUP 0x02000000
 #endif
+
+// These are only defined on x86. For simplicity, we defined
+// them here for all architectures.
+#ifndef ARCH_SET_GS
+#define ARCH_SET_GS 0x1001
+#endif
+#ifndef ARCH_SET_FS
+#define ARCH_SET_FS 0x1002
+#endif
+#ifndef ARCH_GET_FS
+#define ARCH_GET_FS 0x1003
+#endif
+#ifndef ARCH_GET_GS
+#define ARCH_GET_GS 0x1004
+#endif
+
 // New in the 4.12 kernel
 #ifndef ARCH_GET_CPUID
 #define ARCH_GET_CPUID 0x1011
@@ -327,6 +359,22 @@ enum {
   BPF_MAP_GET_NEXT_KEY,
   BPF_PROG_LOAD,
 };
+
+#ifndef O_PATH
+#define O_PATH 040000000
+#endif
+
+#ifndef MAX_HANDLE_SZ
+#define MAX_HANDLE_SZ 128
+#endif
+
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
+
+#ifndef CLONE_PIDFD
+#define CLONE_PIDFD 0x1000
+#endif
 
 } // namespace rr
 

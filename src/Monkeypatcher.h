@@ -62,7 +62,15 @@ public:
    * Zero or more mapping operations are also recorded to the trace and must
    * be replayed.
    */
-  bool try_patch_syscall(RecordTask* t);
+  bool try_patch_syscall(RecordTask* t, bool entering_syscall = true);
+
+  /**
+   * Try to patch the vsyscall-entry pattern occurring right before ret_addr
+   * to instead point into the corresponding entry points in the vdso.
+   * Returns true if the patching succeeded, false if it doesn't. The tasks
+   * registers are left unmodified.
+   */
+  bool try_patch_vsyscall_caller(RecordTask *t, remote_code_ptr ret_addr);
 
   void init_dynamic_syscall_patching(
       RecordTask* t, int syscall_patch_hook_count,

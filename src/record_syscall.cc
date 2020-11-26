@@ -1,19 +1,17 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-#include "record_syscall.h"
-
 #include <arpa/inet.h>
-#include <asm/ldt.h>
-#include <asm/prctl.h>
 #include <dirent.h>
-#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/auxvec.h>
 #include <linux/capability.h>
+#include <linux/elf.h>
 #include <linux/ethtool.h>
 #include <linux/fs.h>
 #include <linux/futex.h>
+#include <linux/hidraw.h>
 #include <linux/if.h>
 #include <linux/if_packet.h>
 #include <linux/if_tun.h>
@@ -23,6 +21,7 @@
 #include <linux/msdos_fs.h>
 #include <linux/msg.h>
 #include <linux/net.h>
+#include <linux/netlink.h>
 #include <linux/perf_event.h>
 #include <linux/personality.h>
 #include <linux/prctl.h>
@@ -60,17 +59,22 @@
 
 #include <rr/rr.h>
 
+#include "record_syscall.h"
+
 #include "preload/preload_interface.h"
 
 #include "AutoRemoteSyscalls.h"
+#include "DiversionSession.h"
 #include "Flags.h"
 #include "MmappedFileMonitor.h"
 #include "ProcFdDirMonitor.h"
 #include "ProcMemMonitor.h"
+#include "ProcStatMonitor.h"
 #include "RecordSession.h"
 #include "RecordTask.h"
 #include "Scheduler.h"
 #include "StdioMonitor.h"
+#include "SysCpuMonitor.h"
 #include "TraceStream.h"
 #include "VirtualPerfCounterMonitor.h"
 #include "ftrace.h"
@@ -95,23 +99,35 @@ union _semun {
  * linux/shm.h.
  */
 static int _shmctl(int shmid, int cmd, shmid64_ds* buf) {
+#ifdef SYS_shmctl
+  int ret = syscall(SYS_shmctl, shmid, cmd, buf);
+  if (ret >= 0 || errno != ENOSYS) {
+    return ret;
+  }
+#endif
+#ifdef SYS_ipc
   if (sizeof(void*) == 4) {
     cmd |= IPC_64;
   }
-#ifdef SYS_shmctl
-  return syscall(SYS_shmctl, shmid, cmd, buf);
-#else
   return syscall(SYS_ipc, SHMCTL, shmid, cmd, 0, buf);
+#else
+  return ret;
 #endif
 }
 static int _semctl(int semid, int semnum, int cmd, _semun un_arg) {
+#ifdef SYS_semctl
+  int ret = syscall(SYS_semctl, semid, semnum, cmd, un_arg);
+  if (ret >= 0 || errno != ENOSYS) {
+    return ret;
+  }
+#endif
+#ifdef SYS_ipc
   if (sizeof(void*) == 4) {
     cmd |= IPC_64;
   }
-#ifdef SYS_semctl
-  return syscall(SYS_semctl, semid, semnum, cmd, un_arg);
-#else
   return syscall(SYS_ipc, SEMCTL, semid, semnum, cmd, &un_arg);
+#else
+  return ret;
 #endif
 }
 
@@ -384,6 +400,8 @@ struct TaskSyscallState {
                                      ArgMutator mutator = nullptr);
 
   typedef void (*AfterSyscallAction)(RecordTask* t);
+  // Register a callback to run when the syscall has completed.
+  // This runs after parameters have been restored.
   void after_syscall_action(AfterSyscallAction action) {
     after_syscall_actions.push_back(action);
   }
@@ -753,7 +771,7 @@ void TaskSyscallState::process_syscall_results() {
     for (size_t i = 0; i < param_list.size(); ++i) {
       auto& param = param_list[i];
       if (param.ptr_in_reg) {
-        r.set_arg(param.ptr_in_reg, param.dest.as_int());
+        r.set_orig_arg(param.ptr_in_reg, param.dest.as_int());
       }
       if (!param.ptr_in_memory.is_null()) {
         memory_cleaned_up = true;
@@ -783,21 +801,46 @@ void TaskSyscallState::process_syscall_results() {
     }
     t->set_regs(r);
   } else {
-    // Step 1: restore all mutated memory
+    // Step 1: Determine the size of all output memory areas
+    for (size_t i = 0; i < param_list.size(); ++i) {
+      eval_param_size(i, actual_sizes);
+    }
+    // Step 2: restore all mutated memory
     for (auto& param : param_list) {
       if (param.mutator) {
         size_t size = param.num_bytes.incoming_size;
         ASSERT(t, saved_data.size() >= size);
+        // If this intersects an output region, we need to be careful not to
+        // clobber what the kernel gave us.
+        for (size_t i = 0; i < param_list.size(); ++i) {
+          auto& param2 = param_list[i];
+          size_t param2_size = actual_sizes[i];
+          if (param2.mode == IN) {
+            continue;
+          }
+          MemoryRange intersection = MemoryRange(param2.dest, param2_size).
+            intersect(MemoryRange(param.dest, size));
+          if (intersection.size() != 0) {
+            // Just update the saved data we already have. We could try
+            // splitting the range and only writing what needs to still change,
+            // but we'd probably just end up doing the exact same number of
+            // syscalls and this is simpler.
+            t->read_bytes_helper(intersection.start(), intersection.size(),
+              saved_data.data() + (intersection.start() - param.dest));
+          }
+        }
         t->write_bytes_helper(param.dest, size, saved_data.data());
         saved_data.erase(saved_data.begin(), saved_data.begin() + size);
       }
     }
     ASSERT(t, saved_data.empty());
-    // Step 2: record all output memory areas
+    // Step 3: record all output memory areas
     for (size_t i = 0; i < param_list.size(); ++i) {
       auto& param = param_list[i];
-      size_t size = eval_param_size(i, actual_sizes);
-      t->record_remote(param.dest, size);
+      size_t size = actual_sizes[i];
+      if (param.mode != IN) {
+        t->record_remote(param.dest, size);
+      }
     }
   }
 
@@ -884,6 +927,14 @@ static bool block_sock_opt(int level, int optname,
       switch (optname) {
         case PACKET_RX_RING:
         case PACKET_TX_RING:
+          syscall_state.emulate_result(-ENOPROTOOPT);
+          return true;
+      }
+      break;
+    case SOL_NETLINK:
+      switch (optname) {
+        case NETLINK_RX_RING:
+        case NETLINK_TX_RING:
           syscall_state.emulate_result(-ENOPROTOOPT);
           return true;
       }
@@ -1348,6 +1399,197 @@ static void record_page_below_stack_ptr(RecordTask* t) {
 
 #define IOCTL_MASK_SIZE(v) ((v) & ~(_IOC_SIZEMASK << _IOC_SIZESHIFT))
 
+typedef ethtool_gstrings GStrings;
+
+template <typename Arch> void get_ethtool_gstrings_arch(RecordTask* t) {
+  auto& syscall_state = *syscall_state_property.get(*t);
+  Registers& regs = syscall_state.syscall_entry_registers;
+  bool ok = true;
+  auto ifreq = t->read_mem(remote_ptr<typename Arch::ifreq>(regs.arg3()), &ok);
+  Registers new_regs = t->regs();
+  if (!ok) {
+    new_regs.set_syscall_result(-EFAULT);
+    t->set_regs(new_regs);
+    return;
+  }
+  remote_ptr<void> p = ifreq.ifr_ifru.ifru_data.rptr();
+  auto orig_gstrings = p.cast<ethtool_gstrings>();
+  auto et_gstrings = t->read_mem(orig_gstrings, &ok);
+  if (!ok) {
+    new_regs.set_syscall_result(-EFAULT);
+    t->set_regs(new_regs);
+    return;
+  }
+  if (et_gstrings.string_set >= 64) {
+    new_regs.set_syscall_result(-EOPNOTSUPP);
+    t->set_regs(new_regs);
+    return;
+  }
+
+  AutoRemoteSyscalls remote(t);
+
+  // Do a ETHTOOL_GSSET_INFO to get the number of strings
+  struct SingleStringSet {
+    ethtool_sset_info et;
+    uint32_t data;
+  };
+  SingleStringSet sss;
+  sss.et.cmd = ETHTOOL_GSSET_INFO;
+  sss.et.reserved = 0;
+  sss.et.sset_mask = 1 << et_gstrings.string_set;
+  AutoRestoreMem sss_mem(remote, &sss, sizeof(sss));
+
+  ifreq.ifr_ifru.ifru_data = sss_mem.get();
+  AutoRestoreMem ifr_mem(remote, &ifreq, sizeof(ifreq));
+
+  long ret = remote.syscall(regs.original_syscallno(), regs.arg1(),
+      SIOCETHTOOL, ifr_mem.get());
+  if (ret < 0) {
+    remote.regs().set_syscall_result(ret);
+    return;
+  }
+
+  sss = t->read_mem(sss_mem.get().cast<SingleStringSet>());
+
+  // Now do the ETHTOOL_GSTRINGS call
+  ret = remote.syscall(regs.original_syscallno(), regs.arg1(), SIOCETHTOOL,
+      regs.arg3());
+  remote.regs().set_syscall_result(ret);
+  if (ret < 0) {
+    return;
+  }
+  t->record_remote(orig_gstrings, sizeof(ethtool_gstrings) + ETH_GSTRING_LEN*sss.data);
+}
+
+static void get_ethtool_gstrings(RecordTask* t) {
+  RR_ARCH_FUNCTION(get_ethtool_gstrings_arch, t->arch(), t);
+}
+
+template <typename Arch> void prepare_ethtool_ioctl(RecordTask* t, TaskSyscallState& syscall_state) {
+  auto ifrp = syscall_state.reg_parameter<typename Arch::ifreq>(3, IN);
+  bool ok = true;
+  auto ifreq = t->read_mem(ifrp, &ok);
+  if (!ok) {
+    syscall_state.expect_errno = EFAULT;
+    return;
+  }
+  remote_ptr<void> payload = REMOTE_PTR_FIELD(ifrp, ifr_ifru.ifru_data);
+  remote_ptr<void> buf_ptr = ifreq.ifr_ifru.ifru_data.rptr();
+  uint32_t cmd = t->read_mem(buf_ptr.cast<uint32_t>(), &ok);
+  if (!ok) {
+    syscall_state.expect_errno = EFAULT;
+    return;
+  }
+
+  switch (cmd) {
+    case ETHTOOL_GSET:
+      syscall_state.mem_ptr_parameter<ethtool_cmd>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GDRVINFO:
+      syscall_state.mem_ptr_parameter<ethtool_drvinfo>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GWOL:
+      syscall_state.mem_ptr_parameter<ethtool_wolinfo>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GREGS: {
+      auto buf = t->read_mem(buf_ptr.cast<ethtool_regs>(), &ok);
+      if (ok) {
+        syscall_state.mem_ptr_parameter(payload, ParamSize(sizeof(buf) + buf.len), IN_OUT);
+      } else {
+        syscall_state.expect_errno = EFAULT;
+        return;
+      }
+      break;
+    }
+    case ETHTOOL_GMODULEEEPROM:
+    case ETHTOOL_GEEPROM: {
+      auto buf = t->read_mem(buf_ptr.cast<ethtool_eeprom>(), &ok);
+      if (ok) {
+        syscall_state.mem_ptr_parameter(payload, ParamSize(sizeof(buf) + buf.len), IN_OUT);
+      } else {
+        syscall_state.expect_errno = EFAULT;
+        return;
+      }
+      break;
+    }
+    case ETHTOOL_GEEE:
+      syscall_state.mem_ptr_parameter<ethtool_eee>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GMODULEINFO:
+      syscall_state.mem_ptr_parameter<ethtool_modinfo>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GCOALESCE:
+      syscall_state.mem_ptr_parameter<ethtool_coalesce>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GRINGPARAM:
+      syscall_state.mem_ptr_parameter<ethtool_ringparam>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GCHANNELS:
+      syscall_state.mem_ptr_parameter<ethtool_channels>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GPAUSEPARAM:
+      syscall_state.mem_ptr_parameter<ethtool_pauseparam>(payload, IN_OUT);
+      break;
+    case ETHTOOL_GSSET_INFO: {
+      auto buf = t->read_mem(buf_ptr.cast<ethtool_sset_info>(), &ok);
+      if (ok) {
+        int bits = pop_count(buf.sset_mask);
+        syscall_state.mem_ptr_parameter(payload, ParamSize(sizeof(buf) + bits*sizeof(uint32_t)), IN_OUT);
+      } else {
+        syscall_state.expect_errno = EFAULT;
+        return;
+      }
+      break;
+    }
+    case ETHTOOL_GSTRINGS: {
+      // These are an enormous pain because to know how much data will be written
+      // back by the kernel, we have to perform a ETHTOOL_GSSET_INFO first.
+      // We can't do that right here because we've already entered the kernel.
+      // So, we emulate this.
+      Registers r = t->regs();
+      r.set_arg1(-1);
+      t->set_regs(r);
+      syscall_state.after_syscall_action(get_ethtool_gstrings);
+      break;
+    }
+    case ETHTOOL_GFEATURES: {
+      auto buf = t->read_mem(buf_ptr.cast<ethtool_gfeatures>(), &ok);
+      if (ok) {
+        syscall_state.mem_ptr_parameter(payload, ParamSize(sizeof(buf) + buf.size*sizeof(ethtool_get_features_block)), IN_OUT);
+      } else {
+        syscall_state.expect_errno = EFAULT;
+        return;
+      }
+      break;
+    }
+    case ETHTOOL_GPERMADDR: {
+      auto buf = t->read_mem(buf_ptr.cast<ethtool_perm_addr>(), &ok);
+      if (ok) {
+        syscall_state.mem_ptr_parameter(payload, ParamSize(sizeof(buf) + buf.size), IN_OUT);
+      } else {
+        syscall_state.expect_errno = EFAULT;
+        return;
+      }
+      break;
+    }
+    case ETHTOOL_SSET:
+    case ETHTOOL_SWOL:
+    case ETHTOOL_SEEPROM:
+    case ETHTOOL_SEEE:
+    case ETHTOOL_SCOALESCE:
+    case ETHTOOL_SRINGPARAM:
+    case ETHTOOL_SCHANNELS:
+    case ETHTOOL_SPAUSEPARAM:
+    case ETHTOOL_SFEATURES:
+      break;
+    default:
+      LOG(debug) << "Unknown ETHTOOL cmd " << cmd;
+      syscall_state.expect_errno = EINVAL;
+      return;
+  }
+  syscall_state.after_syscall_action(record_page_below_stack_ptr);
+}
+
 template <typename Arch>
 static Switchable prepare_ioctl(RecordTask* t,
                                 TaskSyscallState& syscall_state) {
@@ -1378,10 +1620,7 @@ static Switchable prepare_ioctl(RecordTask* t,
    * conventions.  Special case them here. */
   switch (request) {
     case SIOCETHTOOL: {
-      auto ifrp = syscall_state.reg_parameter<typename Arch::ifreq>(3, IN);
-      syscall_state.mem_ptr_parameter<typename Arch::ethtool_cmd>(
-          REMOTE_PTR_FIELD(ifrp, ifr_ifru.ifru_data));
-      syscall_state.after_syscall_action(record_page_below_stack_ptr);
+      prepare_ethtool_ioctl<Arch>(t, syscall_state);
       return PREVENT_SWITCH;
     }
 
@@ -1693,10 +1932,14 @@ static Switchable prepare_ioctl(RecordTask* t,
     case IOCTL_MASK_SIZE(JSIOCGVERSION):
     case IOCTL_MASK_SIZE(JSIOCGAXES):
     case IOCTL_MASK_SIZE(JSIOCGBUTTONS):
-    case IOCTL_MASK_SIZE(JSIOCGCORR):
+    // This gets a list of js_corr structures whose length we don't know without
+    // querying the device ourselves.
+    // case IOCTL_MASK_SIZE(JSIOCGCORR):
     case IOCTL_MASK_SIZE(JSIOCGAXMAP):
     case IOCTL_MASK_SIZE(JSIOCGBTNMAP):
     case IOCTL_MASK_SIZE(JSIOCGNAME(0)):
+    case IOCTL_MASK_SIZE(HIDIOCGRAWINFO):
+    case IOCTL_MASK_SIZE(HIDIOCGRAWNAME(0)):
       syscall_state.reg_parameter(3, size);
       return PREVENT_SWITCH;
 
@@ -1807,28 +2050,32 @@ static bool maybe_emulate_wait(RecordTask* t, TaskSyscallState& syscall_state,
       return true;
     }
   }
-  if (options & WUNTRACED) {
-    for (ThreadGroup* child_process : t->thread_group()->children()) {
-      for (Task* child : child_process->task_set()) {
-        auto rchild = static_cast<RecordTask*>(child);
-        if (rchild->emulated_stop_type == GROUP_STOP &&
-            rchild->emulated_stop_pending && t->is_waiting_for(rchild)) {
-          syscall_state.emulate_wait_for_child = rchild;
-          return true;
-        }
+  for (ThreadGroup* child_process : t->thread_group()->children()) {
+    for (Task* child : child_process->task_set()) {
+      auto rchild = static_cast<RecordTask*>(child);
+      if (rchild->emulated_stop_type == NOT_STOPPED) {
+        continue;
       }
+      if (!(options & WUNTRACED) && rchild->emulated_stop_type != CHILD_STOP) {
+        continue;
+      }
+      if (!rchild->emulated_stop_pending || !t->is_waiting_for(rchild)) {
+        continue;
+      }
+      syscall_state.emulate_wait_for_child = rchild;
+      return true;
     }
   }
   return false;
 }
 
-static void maybe_pause_instead_of_waiting(RecordTask* t, int options) {
+static bool maybe_pause_instead_of_waiting(RecordTask* t, int options) {
   if (t->in_wait_type != WAIT_TYPE_PID || (options & WNOHANG)) {
-    return;
+    return false;
   }
   RecordTask* child = t->session().find_task(t->in_wait_pid);
   if (!child || !t->is_waiting_for_ptrace(child) || t->is_waiting_for(child)) {
-    return;
+    return false;
   }
   // OK, t is waiting for a ptrace child by tid, but since t is not really
   // ptracing child, entering a real wait syscall will not actually wait for
@@ -1839,33 +2086,39 @@ static void maybe_pause_instead_of_waiting(RecordTask* t, int options) {
   // It would be nice if we didn't have to do this, but I can't see a better
   // way.
   Registers r = t->regs();
-  r.set_original_syscallno(syscall_number_for_pause(t->arch()));
+  // pause() would be sufficient here, but we don't have that on all
+  // architectures, so use ppoll(NULL, 0, NULL, NULL), which is what
+  // glibc uses to implement pause() on architectures where the former
+  // doesn't exist
+  r.set_original_syscallno(syscall_number_for_ppoll(t->arch()));
+  r.set_arg1(0);
+  r.set_arg2(0);
+  r.set_arg3(0);
+  r.set_arg4(0);
   t->set_regs(r);
+  return true;
 }
 
 static RecordTask* verify_ptrace_target(RecordTask* tracer,
                                         TaskSyscallState& syscall_state,
                                         pid_t pid) {
   RecordTask* tracee = tracer->session().find_task(pid);
-  if (!tracee || tracee->emulated_ptracer != tracer ||
-      tracee->emulated_stop_type == NOT_STOPPED) {
+  if (!tracee) {
+    LOG(debug) << "tracee pid " << pid << " is unknown to rr";
+    syscall_state.emulate_result(-ESRCH);
+    return nullptr;
+  }
+  if (tracee->emulated_ptracer != tracer) {
+    LOG(debug) << pid << " is not traced by " << tracer->tid;
+    syscall_state.emulate_result(-ESRCH);
+    return nullptr;
+  }
+  if (tracee->emulated_stop_type == NOT_STOPPED) {
+    LOG(debug) << pid << " is not in a ptrace stop";
     syscall_state.emulate_result(-ESRCH);
     return nullptr;
   }
   return tracee;
-}
-
-static void do_ptrace_exit_stop(RecordTask* t) {
-  // Notify ptracer of the exit if it's not going to receive it from the
-  // kernel because it's not the parent. (The kernel has similar logic to
-  // deliver two stops in this case.)
-  t->emulated_ptrace_queued_exit_stop = false;
-  if (t->emulated_ptracer &&
-      (t->is_clone_child() ||
-       t->get_parent_pid() != t->emulated_ptracer->real_tgid())) {
-    // This is a bit wrong; this is an exit stop, not a signal/ptrace stop.
-    t->emulate_ptrace_stop(WaitStatus::for_exit_code(t->exit_code));
-  }
 }
 
 static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
@@ -1890,10 +2143,6 @@ static void prepare_ptrace_cont(RecordTask* tracee, int sig, int command) {
     // Continue the task since we didn't in enter_syscall
     tracee->resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING,
                              RESUME_NO_TICKS);
-  }
-
-  if (tracee->emulated_ptrace_queued_exit_stop) {
-    do_ptrace_exit_stop(tracee);
   }
 }
 
@@ -1963,6 +2212,7 @@ static void ptrace_verify_set_reg_set(RecordTask* t, size_t min_size,
   auto iov = t->read_mem(remote_ptr<typename Arch::iovec>(t->regs().arg4()));
   if (iov.iov_len < min_size) {
     syscall_state.emulate_result(-EIO);
+    return;
   }
   syscall_state.emulate_result(0);
 }
@@ -1972,7 +2222,7 @@ static bool verify_ptrace_options(RecordTask* t,
   // We "support" PTRACE_O_SYSGOOD because we don't support PTRACE_SYSCALL yet
   static const int supported_ptrace_options =
       PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXIT | PTRACE_O_TRACEFORK |
-      PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC;
+      PTRACE_O_TRACECLONE | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC;
 
   if ((int)t->regs().arg4() & ~supported_ptrace_options) {
     LOG(debug) << "Unsupported ptrace options " << HEX(t->regs().arg4());
@@ -2051,13 +2301,210 @@ static void ptrace_attach_to_already_stopped_task(RecordTask* t) {
   t->save_ptrace_signal_siginfo(si);
 }
 
+/**
+ * The PTRACE_GETREGS/PTRACE_SETREGS commands, as well various PEEK_* and POKE_*
+ * ptrace commands are legacy and not implemented on newer architectures.
+ * We split them out here, since these newer platforms
+ * will not define the requisite data structure to serve them.
+ */
+template <typename Arch>
+static void prepare_ptrace_legacy(RecordTask* t,
+                                  TaskSyscallState& syscall_state)
+{
+  pid_t pid = (pid_t)t->regs().arg2_signed();
+  int command = (int)t->regs().arg1_signed();
+  switch (command) {
+    case PTRACE_PEEKTEXT:
+    case PTRACE_PEEKDATA: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        // The actual syscall returns the data via the 'data' out-parameter.
+        // The behavior of returning the data as the system call result is
+        // provided by the glibc wrapper.
+        auto datap =
+            syscall_state.reg_parameter<typename Arch::unsigned_word>(4);
+        remote_ptr<typename Arch::unsigned_word> addr = t->regs().arg3();
+        bool ok = true;
+        auto v = tracee->read_mem(addr, &ok);
+        if (ok) {
+          t->write_mem(datap, v);
+          syscall_state.emulate_result(0);
+        } else {
+          syscall_state.emulate_result(-EIO);
+        }
+      }
+      break;
+    }
+    case PTRACE_POKETEXT:
+    case PTRACE_POKEDATA: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        remote_ptr<typename Arch::unsigned_word> addr = t->regs().arg3();
+        typename Arch::unsigned_word data = t->regs().arg4();
+        bool ok = true;
+        tracee->write_mem(addr, data, &ok);
+        if (ok) {
+          // Since we're recording data that might not be for |t|, we have to
+          // handle this specially during replay.
+          tracee->record_local(addr, &data);
+          syscall_state.emulate_result(0);
+        } else {
+          syscall_state.emulate_result(-EIO);
+        }
+      }
+      break;
+    }
+    case Arch::PTRACE_PEEKUSR: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        // The actual syscall returns the data via the 'data' out-parameter.
+        // The behavior of returning the data as the system call result is
+        // provided by the glibc wrapper.
+        size_t addr = t->regs().arg3();
+        typename Arch::unsigned_word data;
+        if ((addr & (sizeof(data) - 1)) ||
+            addr >= sizeof(typename Arch::user)) {
+          syscall_state.emulate_result(-EIO);
+          break;
+        }
+
+        auto datap =
+            syscall_state.reg_parameter<typename Arch::unsigned_word>(4);
+        if (addr < sizeof(typename Arch::user_regs_struct)) {
+          uint8_t buf[Registers::MAX_SIZE];
+          bool defined;
+          size_t size =
+              tracee->regs().read_register_by_user_offset(buf, addr, &defined);
+          if (defined) {
+            // For unclear reasons, all 32-bit user_regs_struct members are
+            // signed while all 64-bit user_regs_struct members are unsigned.
+            if (Arch::arch() == x86) {
+              data = widen_buffer_signed(buf, size);
+            } else {
+              data = widen_buffer_unsigned(buf, size);
+            }
+          } else {
+            data = 0;
+          }
+        } else if (addr >= offsetof(typename Arch::user, u_debugreg[0]) &&
+                   addr < offsetof(typename Arch::user, u_debugreg[8])) {
+          size_t regno = (addr - offsetof(typename Arch::user, u_debugreg[0])) /
+                         sizeof(data);
+          data = tracee->get_debug_reg(regno);
+        } else {
+          data = 0;
+        }
+
+        t->write_mem(datap, data);
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+    case Arch::PTRACE_POKEUSR: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        // The actual syscall returns the data via the 'data' out-parameter.
+        // The behavior of returning the data as the system call result is
+        // provided by the glibc wrapper.
+        size_t addr = t->regs().arg3();
+        if ((addr & (sizeof(typename Arch::unsigned_word) - 1)) ||
+            addr >= sizeof(typename Arch::user)) {
+          syscall_state.emulate_result(-EIO);
+          break;
+        }
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+    case Arch::PTRACE_GETREGS: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        auto data =
+            syscall_state.reg_parameter<typename Arch::user_regs_struct>(4);
+        auto regs = tracee->regs().get_ptrace_for_arch(Arch::arch());
+        ASSERT(t, regs.size() == data.referent_size());
+        t->write_bytes_helper(data, regs.size(), regs.data());
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+    case Arch::PTRACE_GETFPREGS: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        auto data =
+            syscall_state.reg_parameter<typename Arch::user_fpregs_struct>(4);
+        auto regs = tracee->extra_regs().get_user_fpregs_struct(Arch::arch());
+        ASSERT(t, regs.size() == data.referent_size());
+        t->write_bytes_helper(data, regs.size(), regs.data());
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+    case Arch::PTRACE_GETFPXREGS: {
+      if (Arch::arch() != x86) {
+        // GETFPXREGS is x86-32 only
+        syscall_state.expect_errno = EIO;
+        break;
+      }
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        auto data =
+            syscall_state.reg_parameter<X86Arch::user_fpxregs_struct>(4);
+        auto regs = tracee->extra_regs().get_user_fpxregs_struct();
+        t->write_mem(data, regs);
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+    case Arch::PTRACE_SETREGS: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        // The actual register effects are performed by
+        // Task::on_syscall_exit_arch
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+    case Arch::PTRACE_SETFPREGS: {
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        // The actual register effects are performed by
+        // Task::on_syscall_exit_arch
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+    case Arch::PTRACE_SETFPXREGS: {
+      if (Arch::arch() != x86) {
+        // SETFPXREGS is x86-32 only
+        syscall_state.expect_errno = EIO;
+        break;
+      }
+      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+      if (tracee) {
+        // The actual register effects are performed by
+        // Task::on_syscall_exit_arch
+        syscall_state.emulate_result(0);
+      }
+      break;
+    }
+  }
+}
+
+template <>
+void prepare_ptrace_legacy<ARM64Arch>(RecordTask*, TaskSyscallState&) {
+  // Nothing to do - unimplemented on this architecture
+}
+
+static int non_negative_command(int command) { return command < 0 ? INT32_MAX : command; }
+
 template <typename Arch>
 static Switchable prepare_ptrace(RecordTask* t,
                                  TaskSyscallState& syscall_state) {
   pid_t pid = (pid_t)t->regs().arg2_signed();
   bool emulate = true;
   int command = (int)t->regs().arg1_signed();
-  switch (command) {
+  switch (non_negative_command(command)) {
     case PTRACE_ATTACH: {
       RecordTask* tracee = prepare_ptrace_attach(t, pid, syscall_state);
       if (!tracee) {
@@ -2109,7 +2556,8 @@ static Switchable prepare_ptrace(RecordTask* t,
       syscall_state.emulate_result(0);
       break;
     }
-    case PTRACE_OLDSETOPTIONS:
+    case Arch::PTRACE_OLDSETOPTIONS:
+      RR_FALLTHROUGH;
     case PTRACE_SETOPTIONS: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
       if (tracee) {
@@ -2146,66 +2594,64 @@ static Switchable prepare_ptrace(RecordTask* t,
       }
       break;
     }
-    case PTRACE_GETREGS: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        auto data =
-            syscall_state.reg_parameter<typename Arch::user_regs_struct>(4);
-        auto regs = tracee->regs().get_ptrace_for_arch(Arch::arch());
-        ASSERT(t, regs.size() == data.referent_size());
-        t->write_bytes_helper(data, regs.size(), regs.data());
-        syscall_state.emulate_result(0);
-      }
-      break;
-    }
-    case PTRACE_GETFPREGS: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        auto data =
-            syscall_state.reg_parameter<typename Arch::user_fpregs_struct>(4);
-        auto regs = tracee->extra_regs().get_user_fpregs_struct(Arch::arch());
-        ASSERT(t, regs.size() == data.referent_size());
-        t->write_bytes_helper(data, regs.size(), regs.data());
-        syscall_state.emulate_result(0);
-      }
-      break;
-    }
-    case PTRACE_GETFPXREGS: {
-      if (Arch::arch() != x86) {
-        // GETFPXREGS is x86-32 only
-        syscall_state.expect_errno = EIO;
-        break;
-      }
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        auto data =
-            syscall_state.reg_parameter<X86Arch::user_fpxregs_struct>(4);
-        auto regs = tracee->extra_regs().get_user_fpxregs_struct();
-        t->write_mem(data, regs);
-        syscall_state.emulate_result(0);
-      }
-      break;
-    }
     case PTRACE_GETREGSET: {
       switch ((int)t->regs().arg3()) {
         case NT_PRSTATUS: {
           RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
           if (tracee) {
-            auto regs = tracee->regs().get_ptrace_for_arch(Arch::arch());
+            auto regs = tracee->regs().get_ptrace_for_arch(tracee->arch());
             ptrace_get_reg_set<Arch>(t, syscall_state, regs);
           }
           break;
         }
-        case NT_FPREGSET: {
+        case NT_PRFPREG: {
           RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
           if (tracee) {
             auto regs =
-                tracee->extra_regs().get_user_fpregs_struct(Arch::arch());
+                tracee->extra_regs().get_user_fpregs_struct(tracee->arch());
+            ptrace_get_reg_set<Arch>(t, syscall_state, regs);
+          }
+          break;
+        }
+        case NT_ARM_SYSTEM_CALL: {
+          if (Arch::arch() != aarch64) {
+            syscall_state.expect_errno = EINVAL;
+            emulate = false;
+            break;
+          }
+          RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+          if (tracee) {
+            int syscallno = tracee->regs().original_syscallno();
+            uint8_t *data = (uint8_t*)&syscallno;
+            vector<uint8_t> regs(data, data+sizeof(syscallno));
+            ptrace_get_reg_set<Arch>(t, syscall_state, regs);
+          }
+          break;
+        }
+        case NT_ARM_HW_BREAK:
+        case NT_ARM_HW_WATCH: {
+          if (Arch::arch() != aarch64) {
+            syscall_state.expect_errno = EINVAL;
+            emulate = false;
+            break;
+          }
+          RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+          if (tracee) {
+            ARM64Arch::user_hwdebug_state bps;
+            bool ok = tracee->get_aarch64_debug_regs((int)t->regs().arg3(), &bps);
+            ASSERT(tracee, ok);
+            uint8_t *data = (uint8_t*)&bps;
+            vector<uint8_t> regs(data, data+sizeof(bps));
             ptrace_get_reg_set<Arch>(t, syscall_state, regs);
           }
           break;
         }
         case NT_X86_XSTATE: {
+          if (!Arch::is_x86ish()) {
+            syscall_state.expect_errno = EINVAL;
+            emulate = false;
+            break;
+          }
           RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
           if (tracee) {
             switch (tracee->extra_regs().format()) {
@@ -2214,7 +2660,7 @@ static Switchable prepare_ptrace(RecordTask* t,
                                          tracee->extra_regs().data());
                 break;
               default:
-                syscall_state.emulate_result(EINVAL);
+                syscall_state.emulate_result(-EINVAL);
                 break;
             }
           }
@@ -2224,38 +2670,6 @@ static Switchable prepare_ptrace(RecordTask* t,
           syscall_state.expect_errno = EINVAL;
           emulate = false;
           break;
-      }
-      break;
-    }
-    case PTRACE_SETREGS: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        // The actual register effects are performed by
-        // Task::on_syscall_exit_arch
-        syscall_state.emulate_result(0);
-      }
-      break;
-    }
-    case PTRACE_SETFPREGS: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        // The actual register effects are performed by
-        // Task::on_syscall_exit_arch
-        syscall_state.emulate_result(0);
-      }
-      break;
-    }
-    case PTRACE_SETFPXREGS: {
-      if (Arch::arch() != x86) {
-        // SETFPXREGS is x86-32 only
-        syscall_state.expect_errno = EIO;
-        break;
-      }
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        // The actual register effects are performed by
-        // Task::on_syscall_exit_arch
-        syscall_state.emulate_result(0);
       }
       break;
     }
@@ -2267,19 +2681,52 @@ static Switchable prepare_ptrace(RecordTask* t,
           RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
           if (tracee) {
             ptrace_verify_set_reg_set<Arch>(
-                t, sizeof(typename Arch::user_regs_struct), syscall_state);
+                t, user_regs_struct_size(tracee->arch()), syscall_state);
           }
           break;
         }
-        case NT_FPREGSET: {
+        case NT_PRFPREG: {
           RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
           if (tracee) {
             ptrace_verify_set_reg_set<Arch>(
-                t, sizeof(typename Arch::user_fpregs_struct), syscall_state);
+                t, user_fpregs_struct_size(tracee->arch()), syscall_state);
+          }
+          break;
+        }
+        case NT_ARM_SYSTEM_CALL: {
+          if (Arch::arch() != aarch64) {
+            syscall_state.expect_errno = EINVAL;
+            emulate = false;
+            break;
+          }
+          RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+          if (tracee) {
+            ptrace_verify_set_reg_set<Arch>(
+                t, sizeof(int), syscall_state);
+          }
+          break;
+        }
+        case NT_ARM_HW_WATCH:
+        case NT_ARM_HW_BREAK: {
+          if (Arch::arch() != aarch64) {
+            syscall_state.expect_errno = EINVAL;
+            emulate = false;
+            break;
+          }
+          RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
+          if (tracee) {
+            ptrace_verify_set_reg_set<Arch>(
+                t, offsetof(ARM64Arch::user_hwdebug_state, dbg_regs[0]),
+                syscall_state);
           }
           break;
         }
         case NT_X86_XSTATE: {
+          if (!Arch::is_x86ish()) {
+            syscall_state.expect_errno = EINVAL;
+            emulate = false;
+            break;
+          }
           RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
           if (tracee) {
             switch (tracee->extra_regs().format()) {
@@ -2288,7 +2735,7 @@ static Switchable prepare_ptrace(RecordTask* t,
                     t, tracee->extra_regs().data_size(), syscall_state);
                 break;
               default:
-                syscall_state.emulate_result(EINVAL);
+                syscall_state.emulate_result(-EINVAL);
                 break;
             }
           }
@@ -2301,112 +2748,10 @@ static Switchable prepare_ptrace(RecordTask* t,
       }
       break;
     }
-    case PTRACE_PEEKTEXT:
-    case PTRACE_PEEKDATA: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        // The actual syscall returns the data via the 'data' out-parameter.
-        // The behavior of returning the data as the system call result is
-        // provided by the glibc wrapper.
-        auto datap =
-            syscall_state.reg_parameter<typename Arch::unsigned_word>(4);
-        remote_ptr<typename Arch::unsigned_word> addr = t->regs().arg3();
-        bool ok = true;
-        auto v = tracee->read_mem(addr, &ok);
-        if (ok) {
-          t->write_mem(datap, v);
-          syscall_state.emulate_result(0);
-        } else {
-          syscall_state.emulate_result(-EIO);
-        }
-      }
-      break;
-    }
-    case PTRACE_POKETEXT:
-    case PTRACE_POKEDATA: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        remote_ptr<typename Arch::unsigned_word> addr = t->regs().arg3();
-        typename Arch::unsigned_word data = t->regs().arg4();
-        bool ok = true;
-        tracee->write_mem(addr, data, &ok);
-        if (ok) {
-          // Since we're recording data that might not be for |t|, we have to
-          // handle this specially during replay.
-          tracee->record_local(addr, &data);
-          syscall_state.emulate_result(0);
-        } else {
-          syscall_state.emulate_result(-EIO);
-        }
-      }
-      break;
-    }
-    case PTRACE_PEEKUSER: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        // The actual syscall returns the data via the 'data' out-parameter.
-        // The behavior of returning the data as the system call result is
-        // provided by the glibc wrapper.
-        size_t addr = t->regs().arg3();
-        typename Arch::unsigned_word data;
-        if ((addr & (sizeof(data) - 1)) ||
-            addr >= sizeof(typename Arch::user)) {
-          syscall_state.emulate_result(-EIO);
-          break;
-        }
-
-        auto datap =
-            syscall_state.reg_parameter<typename Arch::unsigned_word>(4);
-        if (addr < sizeof(typename Arch::user_regs_struct)) {
-          uint8_t buf[Registers::MAX_SIZE];
-          bool defined;
-          size_t size =
-              tracee->regs().read_register_by_user_offset(buf, addr, &defined);
-          if (defined) {
-            // For unclear reasons, all 32-bit user_regs_struct members are
-            // signed while all 64-bit user_regs_struct members are unsigned.
-            if (Arch::arch() == x86) {
-              data = widen_buffer_signed(buf, size);
-            } else {
-              data = widen_buffer_unsigned(buf, size);
-            }
-          } else {
-            data = 0;
-          }
-        } else if (addr >= offsetof(typename Arch::user, u_debugreg[0]) &&
-                   addr < offsetof(typename Arch::user, u_debugreg[8])) {
-          size_t regno = (addr - offsetof(typename Arch::user, u_debugreg[0])) /
-                         sizeof(data);
-          data = tracee->get_debug_reg(regno);
-        } else {
-          data = 0;
-        }
-
-        t->write_mem(datap, data);
-        syscall_state.emulate_result(0);
-      }
-      break;
-    }
-    case PTRACE_POKEUSER: {
-      RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
-      if (tracee) {
-        // The actual syscall returns the data via the 'data' out-parameter.
-        // The behavior of returning the data as the system call result is
-        // provided by the glibc wrapper.
-        size_t addr = t->regs().arg3();
-        if ((addr & (sizeof(typename Arch::unsigned_word) - 1)) ||
-            addr >= sizeof(typename Arch::user)) {
-          syscall_state.emulate_result(-EIO);
-          break;
-        }
-        syscall_state.emulate_result(0);
-      }
-      break;
-    }
     case PTRACE_SYSCALL:
     case PTRACE_SINGLESTEP:
-    case PTRACE_SYSEMU:
-    case PTRACE_SYSEMU_SINGLESTEP:
+    case Arch::PTRACE_SYSEMU:
+    case Arch::PTRACE_SYSEMU_SINGLESTEP:
     case PTRACE_CONT: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
       // If the tracer wants to observe syscall entries, we can't use the
@@ -2435,7 +2780,6 @@ static Switchable prepare_ptrace(RecordTask* t,
         tracee->emulated_ptrace_options = 0;
         tracee->emulated_ptrace_cont_command = 0;
         tracee->emulated_stop_pending = false;
-        tracee->emulated_ptrace_queued_exit_stop = false;
         prepare_ptrace_cont(tracee, t->regs().arg4(), 0);
         tracee->set_emulated_ptracer(nullptr);
         syscall_state.emulate_result(0);
@@ -2454,8 +2798,8 @@ static Switchable prepare_ptrace(RecordTask* t,
       }
       break;
     }
-    case PTRACE_GET_THREAD_AREA:
-    case PTRACE_SET_THREAD_AREA: {
+    case Arch::PTRACE_GET_THREAD_AREA:
+    case Arch::PTRACE_SET_THREAD_AREA: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
       if (tracee) {
         if (tracee->arch() != SupportedArch::x86) {
@@ -2464,12 +2808,12 @@ static Switchable prepare_ptrace(RecordTask* t,
           emulate = false;
           break;
         }
-        remote_ptr<struct ::user_desc> remote_addr(t->regs().arg4());
+        remote_ptr<X86Arch::user_desc> remote_addr(t->regs().arg4());
         bool ok = true;
-        struct ::user_desc desc;
-        memset(&desc, 0, sizeof(struct ::user_desc));
+        struct X86Arch::user_desc desc;
+        memset(&desc, 0, sizeof(struct X86Arch::user_desc));
         // Do the ptrace request ourselves
-        if (command == PTRACE_GET_THREAD_AREA) {
+        if (command == Arch::PTRACE_GET_THREAD_AREA) {
           int ret = -tracee->emulate_get_thread_area(t->regs().arg3(), desc);
           if (ret == 0) {
             t->write_mem(remote_addr, desc, &ok);
@@ -2483,7 +2827,7 @@ static Switchable prepare_ptrace(RecordTask* t,
         } else {
           desc = t->read_mem(remote_addr, &ok);
           if (!ok) {
-            syscall_state.emulate_result(EFAULT);
+            syscall_state.emulate_result(-EFAULT);
             break;
           }
           syscall_state.emulate_result(
@@ -2492,7 +2836,7 @@ static Switchable prepare_ptrace(RecordTask* t,
       }
       break;
     }
-    case PTRACE_ARCH_PRCTL: {
+    case Arch::PTRACE_ARCH_PRCTL: {
       RecordTask* tracee = verify_ptrace_target(t, syscall_state, pid);
       if (tracee) {
         if (tracee->arch() != SupportedArch::x86_64) {
@@ -2508,8 +2852,8 @@ static Switchable prepare_ptrace(RecordTask* t,
           case ARCH_GET_GS: {
             bool ok = true;
             remote_ptr<uint64_t> addr(t->regs().arg3());
-            uint64_t data = code == ARCH_GET_FS ? tracee->regs().fs_base()
-                                                : tracee->regs().gs_base();
+            uint64_t data = code == ARCH_GET_FS ?
+                            tracee->regs().fs_base() : tracee->regs().gs_base();
             t->write_mem(addr, data, &ok);
             if (ok) {
               t->record_local(addr, &data);
@@ -2530,6 +2874,20 @@ static Switchable prepare_ptrace(RecordTask* t,
       }
       break;
     }
+    case Arch::PTRACE_PEEKTEXT:
+    case Arch::PTRACE_PEEKDATA:
+    case Arch::PTRACE_POKETEXT:
+    case Arch::PTRACE_POKEDATA:
+    case Arch::PTRACE_PEEKUSR:
+    case Arch::PTRACE_POKEUSR:
+    case Arch::PTRACE_GETREGS:
+    case Arch::PTRACE_GETFPREGS:
+    case Arch::PTRACE_GETFPXREGS:
+    case Arch::PTRACE_SETREGS:
+    case Arch::PTRACE_SETFPREGS:
+    case Arch::PTRACE_SETFPXREGS:
+      prepare_ptrace_legacy<Arch>(t, syscall_state);
+      break;
     default:
       syscall_state.expect_errno = EIO;
       emulate = false;
@@ -2569,13 +2927,12 @@ static bool send_signal_during_init_buffers() {
  * tracee will be returned at a state in which it has entered (or
  * re-entered) SYS_exit/SYS_exit_group.
  */
-static void prepare_exit(RecordTask* t, int exit_code) {
+static void prepare_exit(RecordTask* t) {
   // RecordSession is responsible for ensuring we don't get here with
   // pending signals.
   ASSERT(t, !t->has_stashed_sig());
 
   t->stable_exit = true;
-  t->exit_code = exit_code;
   t->session().scheduler().in_stable_exit(t);
 
   Registers r = t->regs();
@@ -2629,20 +2986,18 @@ static void prepare_exit(RecordTask* t, int exit_code) {
   check_signals_while_exiting(t);
 
   if (t->emulated_ptrace_options & PTRACE_O_TRACEEXIT) {
-    // Ensure that do_ptrace_exit_stop can run later.
-    t->emulated_ptrace_queued_exit_stop = true;
     t->emulate_ptrace_stop(WaitStatus::for_ptrace_event(PTRACE_EVENT_EXIT));
-  } else {
-    // Only allow one stop at a time. After the PTRACE_EVENT_EXIT has been
-    // processed, PTRACE_CONT will call do_ptrace_exit_stop for us.
-    do_ptrace_exit_stop(t);
   }
 }
 
 static void prepare_mmap_register_params(RecordTask* t) {
   Registers r = t->regs();
+  intptr_t mask_flag = MAP_FIXED;
+#ifdef MAP_32BIT
+  mask_flag |= MAP_32BIT;
+#endif
   if (t->session().enable_chaos() &&
-      !(r.arg4_signed() & (MAP_FIXED | MAP_32BIT)) && r.arg1() == 0) {
+      !(r.arg4_signed() & mask_flag) && r.arg1() == 0) {
     // No address hint was provided. Randomize the allocation address.
     size_t len = r.arg2();
     if (r.arg4_signed() & MAP_GROWSDOWN) {
@@ -2704,7 +3059,8 @@ static void init_scratch_memory(RecordTask* t,
       t->vm()->map(t, t->scratch_ptr, sz, prot, flags, 0, string());
   struct stat stat;
   memset(&stat, 0, sizeof(stat));
-  auto record_in_trace = t->trace_writer().write_mapped_region(t, km, stat, vector<TraceRemoteFd>());
+  auto record_in_trace = t->trace_writer().write_mapped_region(t,
+    km, stat, km.fsname(), vector<TraceRemoteFd>());
   ASSERT(t, record_in_trace == TraceWriter::DONT_RECORD_IN_TRACE);
 
   r.set_syscall_result(saved_result);
@@ -2724,9 +3080,6 @@ static int ptrace_option_for_event(int ptrace_event) {
       return 0;
   }
 }
-
-template <typename Arch> static Switchable process_sigreturn(RecordTask* t);
-template <typename Arch> static Switchable process_rt_sigreturn(RecordTask* t);
 
 template <typename Arch>
 static void prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
@@ -2781,6 +3134,7 @@ static void prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
       t->set_regs(r);
       t->enter_syscall();
       r.set_ip(t->regs().ip());
+      r.set_syscallno(original_syscall);
       r.set_original_syscallno(original_syscall);
       t->set_regs(r);
       t->canonicalize_regs(t->arch());
@@ -2816,7 +3170,7 @@ static void prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
   Registers new_r = new_task->regs();
   new_r.set_original_syscallno(
       syscall_state.syscall_entry_registers.original_syscallno());
-  new_r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+  new_r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
   new_task->set_regs(new_r);
   new_task->canonicalize_regs(new_task->arch());
   new_task->set_termination_signal(termination_signal);
@@ -2858,7 +3212,7 @@ static void prepare_clone(RecordTask* t, TaskSyscallState& syscall_state) {
   // see the original registers without our modifications if it inspects them
   // in the ptrace event.
   r = t->regs();
-  r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+  r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
   r.set_original_syscallno(
       syscall_state.syscall_entry_registers.original_syscallno());
   t->set_regs(r);
@@ -2908,11 +3262,11 @@ static bool protect_rr_sigs_sa_mask_arch(RecordTask* t, remote_ptr<void> p,
     return false;
   }
 
-  sa.sa_mask = new_sig_set;
-  t->write_mem(sap, sa);
   if (save) {
     memcpy(save, &sa, sizeof(sa));
   }
+  sa.sa_mask = new_sig_set;
+  t->write_mem(sap, sa);
 
   return true;
 }
@@ -2933,6 +3287,70 @@ static void record_ranges(RecordTask* t,
       s -= bytes;
     }
   }
+}
+
+static pid_t do_detach_teleport(RecordTask *t)
+{
+  DiversionSession session;
+  std::string exe_path(find_exec_stub(t->arch()));
+  std::vector<std::string> argv, env;
+  ScopedFd error_fd;
+  int tracee_fd_number = t->session().tracee_fd_number();
+  Task *new_t = Task::spawn(session, error_fd, &session.tracee_socket_fd(),
+                  &session.tracee_socket_receiver_fd(),
+                  &tracee_fd_number,
+                  exe_path, argv, env,
+                  -1);
+  pid_t new_tid = new_t->tid;
+  LOG(debug) << "Detached task with tid " << new_tid;
+  session.on_create(new_t);
+  session.set_tracee_fd_number(tracee_fd_number);
+  new_t->os_exec_stub(t->arch());
+  session.post_exec();
+  new_t->post_exec(exe_path);
+  new_t->post_exec_syscall();
+  new_t->dup_from(t);
+  // Emulate the success of the syscall in the new task
+  Registers regs = new_t->regs();
+  regs.set_arg1(0);
+  new_t->set_regs(regs);
+  // Disable syscall buffering. XXX: We could also try to unpatch syscalls here
+  new_t->hpc.stop();
+  new_t->set_in_diversion(true);
+  // Just clean up some additional state
+  new_t->reenable_cpuid_tsc();
+  {
+    AutoRemoteSyscalls remote(new_t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
+    remote.syscall(syscall_number_for_close(new_t->arch()), tracee_fd_number);
+  }
+  new_t->detach();
+  new_t->did_kill();
+  delete new_t;
+  return new_tid;
+}
+
+template <typename Arch>
+static Switchable did_emulate_read(int syscallno, RecordTask* t,
+                                   const std::vector<FileMonitor::Range>& ranges,
+                                   uint64_t result,
+                                   TaskSyscallState& syscall_state)
+{
+  syscall_state.emulate_result(result);
+  record_ranges(t, ranges, result);
+  if (syscallno == Arch::pread64 || syscallno == Arch::preadv || result <= 0) {
+    // Don't perform this syscall.
+    Registers r = t->regs();
+    r.set_arg1(-1);
+    t->set_regs(r);
+  } else {
+    // Turn this into an lseek to emulate the advance of the fd ptr
+    Registers r = t->regs();
+    r.set_original_syscallno(Arch::lseek);
+    r.set_arg2(result);
+    r.set_arg3(SEEK_CUR);
+    t->set_regs(r);
+  }
+  return PREVENT_SWITCH;
 }
 
 template <typename Arch>
@@ -2972,6 +3390,15 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
   if (syscallno < 0) {
     // Invalid syscall. Don't let it accidentally match a
     // syscall number below that's for an undefined syscall.
+    if (!Arch::is_x86ish()) {
+      // On architectures where arg1 is shared with the return value, the kernel
+      // may not set -ENOSYS for us. There, it instead copies the arg1 to the return
+      // value (frankly this is probably a bug, but likely nothing we can do
+      // about it).
+      Registers new_regs = regs;
+      new_regs.set_syscall_result(-ENOSYS);
+      t->set_regs(new_regs);
+    }
     syscall_state.expect_errno = ENOSYS;
     return PREVENT_SWITCH;
   }
@@ -3029,35 +3456,49 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return ALLOW_SWITCH;
 
     case Arch::exit:
-      prepare_exit(t, (int)regs.arg1());
+      prepare_exit(t);
       return ALLOW_SWITCH;
 
     case Arch::exit_group:
       if (t->thread_group()->task_set().size() == 1) {
-        prepare_exit(t, (int)regs.arg1());
+        prepare_exit(t);
         return ALLOW_SWITCH;
       }
       return PREVENT_SWITCH;
 
     case Arch::execve: {
+      t->session().scheduler().did_enter_execve(t);
       vector<string> cmd_line;
       remote_ptr<typename Arch::unsigned_word> argv = regs.arg2();
+      bool ok = true;
       while (true) {
-        auto p = t->read_mem(argv);
+        auto p = t->read_mem(argv, &ok);
+        if (!ok) {
+          syscall_state.expect_errno = EFAULT;
+          return ALLOW_SWITCH;
+        }
         if (!p) {
           break;
         }
-        cmd_line.push_back(t->read_c_str(p));
+        cmd_line.push_back(t->read_c_str(p, &ok));
+        if (!ok) {
+          syscall_state.expect_errno = EFAULT;
+          return ALLOW_SWITCH;
+        }
         argv++;
       }
 
       // Save the event. We can't record it here because the exec might fail.
-      string raw_filename = t->read_c_str(regs.arg1());
+      string raw_filename = t->read_c_str(regs.arg1(), &ok);
+      if (!ok) {
+        syscall_state.expect_errno = EFAULT;
+        return ALLOW_SWITCH;
+      }
       syscall_state.exec_saved_event =
           unique_ptr<TraceTaskEvent>(new TraceTaskEvent(
               TraceTaskEvent::for_exec(t->tid, raw_filename, cmd_line)));
 
-      // This can trigger unstable exits of non-main threads, so we have to
+      // This can trigger exits of non-main threads, so we have to
       // allow them to be handled.
       return ALLOW_SWITCH;
     }
@@ -3090,6 +3531,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case Arch::SETPIPE_SZ:
         case Arch::GETPIPE_SZ:
         case Arch::ADD_SEALS:
+        case Arch::GET_SEALS:
         case Arch::SET_RW_HINT:
         case Arch::SET_FILE_RW_HINT:
           break;
@@ -3145,10 +3587,9 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return PREVENT_SWITCH;
     }
 
-    /* int futex(int *uaddr, int op, int val, const struct timespec *timeout,
-     *           int *uaddr2, int val3);
-     * futex parameters are in-out but they can't be moved to scratch
+    /* futex parameters are in-out but they can't be moved to scratch
      * addresses. */
+    case Arch::futex_time64:
     case Arch::futex: {
       int op = regs.arg2_signed();
       switch (op & FUTEX_CMD_MASK) {
@@ -3156,6 +3597,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case FUTEX_WAIT_BITSET:
           return ALLOW_SWITCH;
 
+        case FUTEX_REQUEUE:
         case FUTEX_CMP_REQUEUE:
         case FUTEX_WAKE_OP:
           syscall_state.reg_parameter<int>(5, IN_OUT_NO_SCRATCH);
@@ -3266,6 +3708,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     case Arch::open:
     case Arch::openat:
     case Arch::semop:
+    case Arch::semtimedop_time64:
     case Arch::semtimedop:
     case Arch::sync:
     case Arch::sync_file_range:
@@ -3320,14 +3763,16 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       }
       return ALLOW_SWITCH;
 
-    /* int pselect6(int nfds, fd_set *readfds, fd_set *writefds,
-     *              fd_set *exceptfds, const struct timespec *timeout,
-     *              const pselect6_arg6 *sigmask); */
+    case Arch::pselect6_time64:
     case Arch::pselect6: {
       syscall_state.reg_parameter<typename Arch::fd_set>(2, IN_OUT);
       syscall_state.reg_parameter<typename Arch::fd_set>(3, IN_OUT);
       syscall_state.reg_parameter<typename Arch::fd_set>(4, IN_OUT);
-      syscall_state.reg_parameter<typename Arch::timespec>(5, IN_OUT);
+      if (syscallno == Arch::pselect6) {
+        syscall_state.reg_parameter<typename Arch::timespec>(5, IN_OUT);
+      } else {
+        syscall_state.reg_parameter<typename Arch::Arch64::timespec>(5, IN_OUT);
+      }
       auto arg6p =
           syscall_state.reg_parameter<typename Arch::pselect6_arg6>(6, IN);
       syscall_state.mem_ptr_parameter_inferred(REMOTE_PTR_FIELD(arg6p, ss), IN,
@@ -3358,6 +3803,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       return PREVENT_SWITCH;
     }
 
+    case Arch::recvmmsg_time64:
     case Arch::recvmmsg: {
       auto vlen = (unsigned int)regs.arg3();
       auto mmsgp =
@@ -3429,13 +3875,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       ranges.push_back(FileMonitor::Range(regs.arg2(), regs.arg3()));
       FileMonitor::LazyOffset offset(t, regs, syscallno);
       if (t->fd_table()->emulate_read(fd, t, ranges, offset, &result)) {
-        // Don't perform this syscall.
-        Registers r = regs;
-        r.set_arg1(-1);
-        t->set_regs(r);
-        record_ranges(t, ranges, result);
-        syscall_state.emulate_result(result);
-        return PREVENT_SWITCH;
+        return did_emulate_read<Arch>(syscallno, t, ranges, result, syscall_state);
       }
       syscall_state.reg_parameter(
           2, ParamSize::from_syscall_result<typename Arch::ssize_t>(
@@ -3545,19 +3985,14 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       auto iovecs = t->read_mem(iovecsp, iovcnt);
       uint64_t result;
       vector<FileMonitor::Range> ranges;
+      ranges.reserve(iovcnt);
       for (int i = 0; i < iovcnt; ++i) {
         ranges.push_back(
             FileMonitor::Range(iovecs[i].iov_base, iovecs[i].iov_len));
       }
       FileMonitor::LazyOffset offset(t, regs, syscallno);
       if (t->fd_table()->emulate_read(fd, t, ranges, offset, &result)) {
-        // Don't perform this syscall.
-        Registers r = regs;
-        r.set_arg1(-1);
-        t->set_regs(r);
-        record_ranges(t, ranges, result);
-        syscall_state.emulate_result(result);
-        return PREVENT_SWITCH;
+        return did_emulate_read<Arch>(syscallno, t, ranges, result, syscall_state);
       }
       ParamSize io_size =
           ParamSize::from_syscall_result<typename Arch::ssize_t>();
@@ -3574,10 +4009,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
      */
     case Arch::waitpid:
     case Arch::wait4: {
-      syscall_state.reg_parameter<int>(2, IN_OUT);
-      if (syscallno == Arch::wait4) {
-        syscall_state.reg_parameter<typename Arch::rusage>(4);
-      }
+      Switchable should_switch = ALLOW_SWITCH;
       pid_t pid = (pid_t)regs.arg1_signed();
       if (pid < -1) {
         t->in_wait_type = WAIT_TYPE_PGID;
@@ -3591,21 +4023,31 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         t->in_wait_pid = pid;
       }
       int options = (int)regs.arg3();
+      bool pausing = false;
       if (maybe_emulate_wait(t, syscall_state, options)) {
         Registers r = regs;
         // Set options to an invalid value to force syscall to fail
         r.set_arg3(0xffffffff);
         t->set_regs(r);
-        return PREVENT_SWITCH;
+        should_switch = PREVENT_SWITCH;
+      } else if (maybe_pause_instead_of_waiting(t, options)) {
+        pausing = true;
       }
-      maybe_pause_instead_of_waiting(t, options);
-      return ALLOW_SWITCH;
+      // When pausing, we've modified the registers and will emulate the
+      // memory changes on syscall exit. We avoid modifying these registers
+      // with pointers to scratch memory, so mark them _NO_SCRATCH if we're
+      // pausing.
+      syscall_state.reg_parameter<int>(2, pausing ? IN_OUT_NO_SCRATCH : IN_OUT);
+      if (syscallno == Arch::wait4) {
+        syscall_state.reg_parameter<typename Arch::rusage>(4,
+          pausing ? IN_OUT_NO_SCRATCH : OUT);
+      }
+      return should_switch;
     }
 
     case Arch::waitid: {
-      syscall_state.reg_parameter<typename Arch::siginfo_t>(3, IN_OUT);
-      t->in_wait_pid = (id_t)regs.arg2();
-      switch ((idtype_t)regs.arg1()) {
+      id_t wait_pid = (id_t)regs.arg2();
+      switch ((uint32_t)regs.arg1()) {
         case P_ALL:
           t->in_wait_type = WAIT_TYPE_ANY;
           break;
@@ -3615,20 +4057,37 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case P_PGID:
           t->in_wait_type = WAIT_TYPE_PGID;
           break;
+        case P_PIDFD:
+          wait_pid = t->pid_of_pidfd(regs.arg2());
+          if (!t->session().find_task(wait_pid)) {
+            // Waiting on a non-tracee; just let it happen as normal
+            // We also take this path if pid_of_pidfd returns -1
+            // because the fd is not a pidfd.
+            syscall_state.reg_parameter<typename Arch::siginfo_t>(3);
+            return ALLOW_SWITCH;
+          }
+          t->in_wait_type = WAIT_TYPE_PID;
+          break;
         default:
           syscall_state.expect_errno = EINVAL;
           break;
       }
+      Switchable should_switch = ALLOW_SWITCH;
+      t->in_wait_pid = wait_pid;
       int options = (int)regs.arg4();
+      bool pausing = false;
       if (maybe_emulate_wait(t, syscall_state, options)) {
         Registers r = regs;
         // Set options to an invalid value to force syscall to fail
         r.set_arg4(0xffffffff);
         t->set_regs(r);
-        return PREVENT_SWITCH;
+        should_switch = PREVENT_SWITCH;
+      } else {
+        pausing = maybe_pause_instead_of_waiting(t, options);
       }
-      maybe_pause_instead_of_waiting(t, options);
-      return ALLOW_SWITCH;
+      syscall_state.reg_parameter<typename Arch::siginfo_t>(3,
+        pausing ? IN_OUT_NO_SCRATCH : IN_OUT);
+      return should_switch;
     }
 
     case Arch::setpriority:
@@ -3656,14 +4115,15 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     case Arch::pause:
       return ALLOW_SWITCH;
 
-    /* int poll(struct pollfd *fds, nfds_t nfds, int timeout) */
-    /* int ppoll(struct pollfd *fds, nfds_t nfds,
-     *           const struct timespec *timeout_ts,
-     *           const sigset_t *sigmask); */
+    case Arch::ppoll_time64:
     case Arch::ppoll:
       /* The raw syscall modifies this with the time remaining. The libc
          does not expose this functionality however */
-      syscall_state.reg_parameter<typename Arch::timespec>(3, IN_OUT);
+      if (syscallno == Arch::ppoll) {
+        syscall_state.reg_parameter<typename Arch::timespec>(3, IN_OUT);
+      } else {
+        syscall_state.reg_parameter<typename Arch::Arch64::timespec>(3, IN_OUT);
+      }
       syscall_state.reg_parameter<typename Arch::kernel_sigset_t>(
           4, IN, protect_rr_sigs);
       t->invalidate_sigmask();
@@ -3679,7 +4139,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       RecordTask* target = t->session().find_task((pid_t)regs.arg2_signed());
       int cpu = regs.arg3_signed();
       unsigned long flags = regs.arg5();
-      if (target && cpu == -1 && !flags) {
+      int allowed_perf_flags = PERF_FLAG_FD_CLOEXEC;
+      if (target && cpu == -1 && !(flags & ~allowed_perf_flags)) {
         auto attr =
             t->read_mem(remote_ptr<struct perf_event_attr>(regs.arg1()));
         if (VirtualPerfCounterMonitor::should_virtualize(attr)) {
@@ -3687,7 +4148,9 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
           // Turn this into an inotify_init() syscall. This just gives us an
           // allocated fd. Syscalls using this fd will be emulated (except for
           // close()).
-          r.set_original_syscallno(Arch::inotify_init);
+          r.set_original_syscallno(Arch::inotify_init1);
+          int in_flags = (flags & PERF_FLAG_FD_CLOEXEC) ? O_CLOEXEC : 0;
+          r.set_arg1(in_flags);
           t->set_regs(r);
         }
       }
@@ -3746,6 +4209,10 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case PR_CAPBSET_READ:
         case PR_GET_SPECULATION_CTRL:
         case PR_SET_SPECULATION_CTRL:
+        case PR_GET_THP_DISABLE:
+        case PR_SET_THP_DISABLE:
+        case PR_SET_SECUREBITS:
+        case PR_GET_SECUREBITS:
           break;
 
         case PR_SET_DUMPABLE:
@@ -4006,6 +4473,10 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       syscall_state.reg_parameter<typename Arch::timespec>(4);
       return ALLOW_SWITCH;
 
+    case Arch::clock_nanosleep_time64:
+      syscall_state.reg_parameter<typename Arch::Arch64::timespec>(4);
+      return ALLOW_SWITCH;
+
     case Arch::sched_yield:
       t->session().scheduler().schedule_one_round_robin(t);
       return ALLOW_SWITCH;
@@ -4014,6 +4485,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       syscall_state.reg_parameter(1, (size_t)regs.arg2());
       return PREVENT_SWITCH;
 
+    case Arch::rt_sigtimedwait_time64:
     case Arch::rt_sigtimedwait:
       syscall_state.reg_parameter<typename Arch::siginfo_t>(2);
       return ALLOW_SWITCH;
@@ -4048,6 +4520,11 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
           2, ParamSize::from_syscall_result<ssize_t>(regs.arg3()));
       return PREVENT_SWITCH;
 
+    case Arch::sched_getattr: {
+      syscall_state.reg_parameter(2, ParamSize(regs.arg3()));
+      return PREVENT_SWITCH;
+    }
+
     case Arch::sched_setaffinity: {
       // Ignore all sched_setaffinity syscalls. They might interfere
       // with our own affinity settings.
@@ -4060,8 +4537,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
     }
 
     case Arch::sched_getaffinity:
-      syscall_state.reg_parameter(
-          3, ParamSize::from_syscall_result<int>((unsigned int)regs.arg2()));
+      syscall_state.reg_parameter(3, ParamSize(regs.arg2()));
       return PREVENT_SWITCH;
 
     case Arch::ptrace:
@@ -4123,6 +4599,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case MADV_NOHUGEPAGE:
         case MADV_DONTDUMP:
         case MADV_DODUMP:
+        case MADV_WIPEONFORK:
+        case MADV_KEEPONFORK:
           break;
         case MADV_FREE: {
           // MADV_FREE introduces nondeterminism --- the kernel zeroes the
@@ -4199,6 +4677,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 
     case SYS_rrcall_notify_control_msg:
     case SYS_rrcall_init_preload:
+    case SYS_rrcall_notify_stap_semaphore_added:
+    case SYS_rrcall_notify_stap_semaphore_removed:
       syscall_state.emulate_result(0);
       return PREVENT_SWITCH;
 
@@ -4209,6 +4689,59 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
       }
       syscall_state.reg_parameter<rrcall_init_buffers_params<Arch>>(1, IN_OUT);
       return PREVENT_SWITCH;
+
+    case SYS_rrcall_check_presence: {
+      // Since this is "user" facing, we follow best practices for regular
+      // syscalls and make sure that unused arguments (in this case all of them)
+      // are zero.
+      bool arguments_are_zero = true;
+      Registers r = t->regs();
+      for (int i = 1; i <= 6; ++i) {
+        arguments_are_zero &= r.arg(i) == 0;
+      }
+      syscall_state.emulate_result(arguments_are_zero ? 0 : (uintptr_t)-EINVAL);
+      syscall_state.expect_errno = ENOSYS;
+      return PREVENT_SWITCH;
+    }
+
+    case SYS_rrcall_detach_teleport: {
+      bool arguments_are_zero = true;
+      Registers r = t->regs();
+      for (int i = 1; i <= 6; ++i) {
+        arguments_are_zero &= r.arg(i) == 0;
+      }
+      if (!arguments_are_zero) {
+        syscall_state.emulate_result((uintptr_t)-EINVAL);
+        syscall_state.expect_errno = ENOSYS;
+        return PREVENT_SWITCH;
+      }
+
+      t->exit_syscall();
+      Registers regs = t->regs();
+      pid_t new_tid = do_detach_teleport(t);
+
+      // Cause the actual task to exit
+      regs.set_syscallno(SYS_exit_group);
+      regs.set_arg1(0);
+      regs.set_original_syscallno(-1);
+      regs.set_ip(regs.ip() - syscall_instruction_length(t->arch()));
+      ASSERT(t, is_at_syscall_instruction(t, regs.ip()));;
+      // Restart the SYS_exit call.
+      t->set_regs(regs);
+      t->enter_syscall();
+      t->exit_syscall();
+
+      // Don't reap the zombie to prevent the pid from being re-used, which
+      // the child might see.
+      t->detached_proxy = true;
+      // Just have the same task object represent both the zombie task
+      // and be able to receive death notices for the detached tracee
+      // to forward.
+      t->session().on_proxy_detach(t, new_tid);
+      t->rec_tid = new_tid;
+
+      return ALLOW_SWITCH;
+    }
 
     case Arch::brk:
     case Arch::munmap:
@@ -4227,9 +4760,38 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 
     case Arch::sigreturn:
     case Arch::rt_sigreturn:
+      // If a sigreturn/rt_sigreturn ever comes through the syscallbuf, we
+      // have switched to the syscallbuf stack (which does not contain any of the
+      // kernel's sigframe data) and we are about to explode (when the kernel restores
+      // the program's registers to random garbage from the syscallbuf stack). Die now
+      // with a useful error message.
+      //
+      // We decline to patch syscall instructions when they're invoked with the
+      // sigreturn/rt_sigreturn syscall. This covers the kernel's inserted sigreturn
+      // trampolines. If the program intentionally invokes these syscalls through a
+      // generic wrapper like syscall(2), it'll have to be recorded with the syscallbuf
+      // disabled.
+      ASSERT(t, !t->is_in_rr_page()) <<
+        "sigreturn/rt_sigreturn syscalls cannot be processed through the syscallbuf "
+        "because the stack pointer will be wrong. Is this program invoking them "
+        "through the glibc `syscall` wrapper?\nrerecord with -n to fix this";
+      if (t->arch() == aarch64) {
+        // This is a bit of a hack, but we don't really have a
+        // good way to do this otherwise. We need to record the
+        // restored x7 register, but the kernel will lie to us
+        // about it.
+        remote_ptr<ARM64Arch::rt_sigframe> frame = t->regs().sp().cast<ARM64Arch::rt_sigframe>();
+        auto x_regs_arr = REMOTE_PTR_FIELD(REMOTE_PTR_FIELD(
+          REMOTE_PTR_FIELD(REMOTE_PTR_FIELD(frame, uc), uc_mcontext),
+          regs),x);
+        auto x7 = t->read_mem(x_regs_arr.field((uintptr_t*)nullptr,
+          7 * sizeof(uintptr_t)));
+        syscall_state.syscall_entry_registers.set_x7(x7);
+      }
       t->invalidate_sigmask();
       return PREVENT_SWITCH;
 
+    case Arch::mq_timedreceive_time64:
     case Arch::mq_timedreceive: {
       syscall_state.reg_parameter(
           2, ParamSize::from_syscall_result<typename Arch::ssize_t>(
@@ -4251,7 +4813,7 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
 
     case Arch::name_to_handle_at: {
       syscall_state.reg_parameter(3,
-                                  sizeof(struct file_handle) + MAX_HANDLE_SZ);
+                                  sizeof(typename Arch::file_handle) + MAX_HANDLE_SZ);
       syscall_state.reg_parameter(4, sizeof(int));
       return ALLOW_SWITCH;
     }
@@ -4282,13 +4844,6 @@ Switchable rec_prepare_syscall(RecordTask* t) {
   syscall_state.init(t);
 
   Switchable s = rec_prepare_syscall_internal(t, syscall_state);
-  int syscallno = t->ev().Syscall().number;
-  if (is_sigreturn(syscallno, t->ev().Syscall().arch())) {
-    // There isn't going to be an exit event for this syscall, so remove
-    // syscall_state now.
-    syscall_state_property.remove(*t);
-    return s;
-  }
   return syscall_state.done_preparing(s);
 }
 
@@ -4300,13 +4855,30 @@ void rec_abort_prepared_syscall(RecordTask* t) {
   }
 }
 
+static void aarch64_kernel_bug_workaround(RecordTask *t,
+                                          const TaskSyscallState &syscall_state)
+{
+  if (syscall_state.syscall_entry_registers.arch() == aarch64) {
+    // The kernel lies about the real register state during syscall exits.
+    // Try to fix that up to retain some measure of sanity (otherwise we
+    // might leak an incorrect register into userspace, causing an
+    // un-recorded divergence). I'm really hoping to get this fixed
+    // in the kernel.
+    Registers r = t->regs();
+    r.set_x7(syscall_state.syscall_entry_registers.x7());
+    t->set_regs(r);
+  }
+}
+
 template <typename Arch>
 static void rec_prepare_restart_syscall_arch(RecordTask* t,
                                              TaskSyscallState& syscall_state) {
   int syscallno = t->ev().Syscall().number;
+  aarch64_kernel_bug_workaround(t, syscall_state);
   switch (syscallno) {
     case Arch::nanosleep:
     case Arch::clock_nanosleep:
+    case Arch::clock_nanosleep_time64:
       /* Hopefully uniquely among syscalls, nanosleep()/clock_nanosleep()
        * requires writing to its remaining-time outparam
        * *only if* the syscall fails with -EINTR.  When a
@@ -4321,7 +4893,9 @@ static void rec_prepare_restart_syscall_arch(RecordTask* t,
       syscall_state.process_syscall_results();
       break;
     case Arch::ppoll:
+    case Arch::ppoll_time64:
     case Arch::pselect6:
+    case Arch::pselect6_time64:
     case Arch::sigsuspend:
     case Arch::rt_sigsuspend:
       t->invalidate_sigmask();
@@ -4357,7 +4931,7 @@ static const char* dropped_privs_warning =
     "          Capabilities did not take effect. Errors may follow.\n"
     "          To record this execution faithfully, re-run rr as:\n"
     "\n"
-    "             sudo -EP rr record --setuid-sudo\n"
+    "             sudo -EP --preserve-env=HOME rr record --setuid-sudo\n"
     "\n";
 
 static bool is_privileged_executable(RecordTask* t, const string& path) {
@@ -4448,6 +5022,31 @@ static remote_ptr<void> get_exe_entry(Task* t) {
   return remote_ptr<void>();
 }
 
+/**
+ * Given `file_name`, where `file_name` is relative to our root directory
+ * but is in the mount namespace of `t`, try to make it a file we can read.
+ */
+static string try_make_process_file_name(RecordTask* t,
+                                         const std::string& file_name) {
+  char proc_root[32];
+  // /proc/<pid>/root has magical properties; not only is it a link, but
+  // it links to a view of the filesystem as the process sees it, taking into
+  // account the process mount namespace etc.
+  snprintf(proc_root, sizeof(proc_root), "/proc/%d/root", t->tid);
+  char root[PATH_MAX];
+  ssize_t ret = readlink(proc_root, root, sizeof(root) - 1);
+  ASSERT(t, ret >= 0);
+  root[ret] = 0;
+
+  if (strncmp(root, file_name.c_str(), ret)) {
+    LOG(debug) << "File " << file_name << " is outside known root "
+               << proc_root;
+    return file_name;
+  }
+  return string(proc_root) + (ret == 1 ? file_name : file_name.substr(ret));
+}
+
+
 static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   Registers r = t->regs();
   if (r.syscall_failed()) {
@@ -4464,6 +5063,7 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       t->vm()->mapping_of(AddressSpace::rr_page_start()).map;
   auto mode = t->trace_writer().write_mapped_region(
       t, rr_page_mapping, rr_page_mapping.fake_stat(),
+      rr_page_mapping.fsname(),
       vector<TraceRemoteFd>(),
       TraceWriter::RR_BUFFER_MAPPING);
   ASSERT(t, mode == TraceWriter::DONT_RECORD_IN_TRACE);
@@ -4473,11 +5073,13 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
   mode = t->trace_writer().write_mapped_region(
       t, preload_thread_locals_mapping,
       preload_thread_locals_mapping.fake_stat(),
+      preload_thread_locals_mapping.fsname(),
       vector<TraceRemoteFd>(),
       TraceWriter::RR_BUFFER_MAPPING);
   ASSERT(t, mode == TraceWriter::DONT_RECORD_IN_TRACE);
 
   KernelMapping vvar;
+  KernelMapping vdso;
 
   // get the remote executable entry point
   // with the pointer, we find out which mapping is the executable
@@ -4493,6 +5095,8 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       stacks.push_back(km);
     } else if (km.is_vvar()) {
       vvar = km;
+    } else if (km.is_vdso()) {
+      vdso = km;
     }
 
     // if true, this mapping is our executable
@@ -4520,8 +5124,15 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       t->vm()->unmap(t, vvar.start(), vvar.size());
     }
 
+    if (t->session().unmap_vdso() && vdso.size()) {
+      remote.infallible_syscall(syscall_number_for_munmap(remote.arch()),
+                                vdso.start(), vdso.size());
+      t->vm()->unmap(t, vdso.start(), vdso.size());
+    }
+
     for (auto& km : stacks) {
-      mode = t->trace_writer().write_mapped_region(t, km, km.fake_stat(), vector<TraceRemoteFd>(),
+      mode = t->trace_writer().write_mapped_region(t, km, km.fake_stat(),
+                                                   km.fsname(), vector<TraceRemoteFd>(),
                                                    TraceWriter::EXEC_MAPPING);
       ASSERT(t, mode == TraceWriter::RECORD_IN_TRACE);
       auto buf = t->read_mem(km.start().cast<uint8_t>(), km.size());
@@ -4565,12 +5176,13 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
       continue;
     }
     struct stat st;
-    if (stat(km.fsname().c_str(), &st) != 0) {
+    string file_name = try_make_process_file_name(t, km.fsname());
+    if (stat(file_name.c_str(), &st) != 0) {
       st = km.fake_stat();
       // Size is not real. Don't confuse the logic below
       st.st_size = 0;
     }
-    if (t->trace_writer().write_mapped_region(t, km, st, vector<TraceRemoteFd>(),
+    if (t->trace_writer().write_mapped_region(t, km, st, file_name, vector<TraceRemoteFd>(),
                                               TraceWriter::EXEC_MAPPING) ==
         TraceWriter::RECORD_IN_TRACE) {
       if (st.st_size > 0) {
@@ -4582,7 +5194,7 @@ static void process_execve(RecordTask* t, TaskSyscallState& syscall_state) {
         t->record_remote(km.start(), km.size());
       }
     } else {
-      // See https://github.com/mozilla/rr/issues/1568; in some cases
+      // See https://github.com/rr-debugger/rr/issues/1568; in some cases
       // after exec we have memory areas that are rwx. These areas have
       // a trailing page that may be partially zeroed by the kernel. Record the
       // trailing page of every mapping just to be simple and safe.
@@ -4616,25 +5228,24 @@ static bool monitor_fd_for_mapping(RecordTask* mapped_t, int mapped_fd, const st
   auto mapped_table = mapped_t->fd_table();
   for (auto& ts : mapped_t->session().tasks()) {
     auto rt = static_cast<RecordTask*>(ts.second);
-    if (rt->unstable) {
-      // This task isn't a problem because it's exiting and won't write to its
-      // fds. (Well in theory there could be a write in progress I suppose, but
-      // let's ignore that for now :-().) Anyway, reading its /proc/.../fd will
-      // probably fail.
+    if (rt->already_exited()) {
       continue;
     }
     auto table = rt->fd_table();
     if (tables.find(table.get()) != tables.end()) {
       continue;
     }
-    tables.insert(table.get());
 
     char buf[100];
     sprintf(buf, "/proc/%d/fd", rt->tid);
     DIR* dir = opendir(buf);
-    if (!dir) {
-      FATAL() << "Can't open fd directory " << buf;
+    if (!dir && (errno == EACCES || errno == ENOENT)) {
+      LOG(warn) << "Task must have exited out from underneath us. Skipping it";
+      continue;
     }
+    ASSERT(rt, dir) << "Can't open fd directory " << buf;
+    tables.insert(table.get());
+
     struct dirent* d;
     errno = 0;
     vector<string> names;
@@ -4663,9 +5274,7 @@ static bool monitor_fd_for_mapping(RecordTask* mapped_t, int mapped_fd, const st
       }
       extra_fds.push_back({ rt->tid, fd });
     }
-    if (errno) {
-      FATAL() << "Can't read fd directory " << buf;
-    }
+    ASSERT(rt, !errno) << "Can't read fd directory " << buf;
     closedir(dir);
   }
   ASSERT(mapped_t, found_our_mapping) << "Can't find fd for mapped file";
@@ -4698,7 +5307,7 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
       km = t->vm()->map(t, addr, size, prot, flags, 0, kernel_info.fsname(),
                         kernel_info.device(), kernel_info.inode());
     }
-    auto d = t->trace_writer().write_mapped_region(t, km, km.fake_stat(), vector<TraceRemoteFd>());
+    auto d = t->trace_writer().write_mapped_region(t, km, km.fake_stat(), km.fsname(), vector<TraceRemoteFd>());
     ASSERT(t, d == TraceWriter::DONT_RECORD_IN_TRACE);
     return;
   }
@@ -4706,11 +5315,23 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
   ASSERT(t, fd >= 0) << "Valid fd required for file mapping";
   ASSERT(t, !(flags & MAP_GROWSDOWN));
 
+  bool effectively_anonymous = false;
   auto st = t->stat_fd(fd);
-  string file_name = t->file_name_of_fd(fd);
+  string our_file_name =t->proc_fd_path(fd);
+  string tracee_file_name = t->file_name_of_fd(fd);
+  if (MAJOR(st.st_rdev) == 1 &&
+      MINOR(st.st_rdev) == 5) {
+    // mmapping /dev/zero is equivalent to MAP_ANONYMOUS, just more annoying.
+    // grab the device/inode from the kernel mapping so that it will be unique.
+    KernelMapping kernel_synthetic_info = t->vm()->read_kernel_mapping(t, addr);
+    st.st_dev = kernel_synthetic_info.device();
+    st.st_ino = kernel_synthetic_info.inode();
+    our_file_name = tracee_file_name = kernel_synthetic_info.fsname();
+    effectively_anonymous = true;
+  }
 
   KernelMapping km =
-      t->vm()->map(t, addr, size, prot, flags, offset, file_name, st.st_dev,
+      t->vm()->map(t, addr, size, prot, flags, offset, tracee_file_name, st.st_dev,
                    st.st_ino, unique_ptr<struct stat>(new struct stat(st)));
 
   bool adjusted_size = false;
@@ -4723,10 +5344,10 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
 
   vector<TraceRemoteFd> extra_fds;
   bool monitor_this_fd = false;
-  if (flags & MAP_SHARED) {
+  if ((flags & MAP_SHARED) && !effectively_anonymous) {
     monitor_this_fd = monitor_fd_for_mapping(t, fd, st, extra_fds);
   }
-  if (t->trace_writer().write_mapped_region(t, km, st, extra_fds,
+  if (t->trace_writer().write_mapped_region(t, km, st, our_file_name, extra_fds,
                                             TraceWriter::SYSCALL_MAPPING,
                                             !monitor_this_fd) ==
       TraceWriter::RECORD_IN_TRACE) {
@@ -4748,7 +5369,7 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
           << " after; is filesystem full?";
     }
   }
-  if (flags & MAP_SHARED) {
+  if ((flags & MAP_SHARED) && !effectively_anonymous) {
     // Setting up MmappedFileMonitor may trigger updates to syscallbuf_fds_disabled
     // in the tracee, recording memory records. Those should be recorded now, after the
     // memory region data itself. Needs to be consistent with replay_syscall.
@@ -4766,13 +5387,14 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
         rt->fd_table()->add_monitor(rt, f.fd, new MmappedFileMonitor(rt, f.fd));
       }
     }
-  }
 
-  if ((prot & PROT_WRITE) && (flags & MAP_SHARED)) {
-    LOG(debug) << file_name << " is SHARED|writable; that's not handled "
-                               "correctly yet. Optimistically hoping it's not "
-                               "written by programs outside the rr tracee "
-                               "tree.";
+    if ((prot & PROT_WRITE)) {
+      LOG(debug) << tracee_file_name <<
+        " is SHARED|writable; that's not handled "
+        "correctly yet. Optimistically hoping it's not "
+        "written by programs outside the rr tracee "
+        "tree.";
+    }
   }
 
   // We don't want to patch MAP_SHARED files. In the best case we'd end crashing
@@ -4784,8 +5406,8 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
   }
 
   if ((prot & (PROT_WRITE | PROT_READ)) == PROT_READ && (flags & MAP_SHARED) &&
-      !(flags & MAP_ANONYMOUS)) {
-    MonitoredSharedMemory::maybe_monitor(t, file_name,
+      !effectively_anonymous) {
+    MonitoredSharedMemory::maybe_monitor(t, tracee_file_name,
                                          t->vm()->mapping_of(addr), fd, offset);
   }
 }
@@ -4809,7 +5431,8 @@ static void process_mremap(RecordTask* t, remote_ptr<void> old_addr,
 
   // Make sure that the trace records the mapping at the new location, even
   // if the mapping didn't grow.
-  auto r = t->trace_writer().write_mapped_region(t, km, st, vector<TraceRemoteFd>(),
+  auto r = t->trace_writer().write_mapped_region(t, km, st, km.fsname(),
+                                                 vector<TraceRemoteFd>(),
                                                  TraceWriter::REMAP_MAPPING);
   ASSERT(t, r == TraceWriter::DONT_RECORD_IN_TRACE);
   if (old_size >= new_size) {
@@ -4824,7 +5447,8 @@ static void process_mremap(RecordTask* t, remote_ptr<void> old_addr,
     st.st_size = m.map.file_offset_bytes() + new_size;
   }
 
-  if (t->trace_writer().write_mapped_region(t, km, st,  vector<TraceRemoteFd>()) ==
+  if (t->trace_writer().write_mapped_region(t, km, st, km.fsname(),
+                                            vector<TraceRemoteFd>()) ==
       TraceWriter::RECORD_IN_TRACE) {
     off64_t end = max<off64_t>(st.st_size - km.file_offset_bytes(), 0);
     // Allow failure; the underlying file may have true zero size, in which
@@ -4863,7 +5487,7 @@ static void process_shmat(RecordTask* t, int shmid, int shm_flags,
                    kernel_info.device(), kernel_info.inode());
   t->vm()->set_shm_size(km.start(), km.size());
   auto disposition =
-      t->trace_writer().write_mapped_region(t, km, km.fake_stat(), vector<TraceRemoteFd>());
+      t->trace_writer().write_mapped_region(t, km, km.fake_stat(), km.fsname(), vector<TraceRemoteFd>());
   ASSERT(t, disposition == TraceWriter::RECORD_IN_TRACE);
   t->record_remote(addr, size);
 
@@ -4883,13 +5507,21 @@ static string extra_expected_errno_info(RecordTask* t,
       switch (t->regs().original_syscallno()) {
         case Arch::ioctl: {
           int request = (int)t->regs().arg2_signed();
-          int type = _IOC_TYPE(request);
-          int nr = _IOC_NR(request);
-          int dir = _IOC_DIR(request);
-          int size = _IOC_SIZE(request);
-          ss << "; Unknown ioctl(" << HEX(request) << "): type:" << HEX(type)
-             << " nr:" << HEX(nr) << " dir:" << HEX(dir) << " size:" << size
-             << " addr:" << HEX(t->regs().arg3());
+          if (request == SIOCETHTOOL) {
+            auto ifreq_ptr = remote_ptr<typename Arch::ifreq>(t->regs().arg3());
+            auto ifreq = t->read_mem(ifreq_ptr);
+            remote_ptr<void> cmd_ptr = ifreq.ifr_ifru.ifru_data.rptr();
+            auto cmd = t->read_mem(cmd_ptr.cast<uint32_t>());
+            ss << "; unknown ETHTOOL command " << cmd;
+          } else {
+            int type = _IOC_TYPE(request);
+            int nr = _IOC_NR(request);
+            int dir = _IOC_DIR(request);
+            int size = _IOC_SIZE(request);
+            ss << "; Unknown ioctl(" << HEX(request) << "): type:" << HEX(type)
+               << " nr:" << HEX(nr) << " dir:" << HEX(dir) << " size:" << size
+               << " addr:" << HEX(t->regs().arg3());
+          }
           break;
         }
         case Arch::fcntl:
@@ -4913,6 +5545,7 @@ static string extra_expected_errno_info(RecordTask* t,
         case Arch::ipc:
           ss << "; unknown ipc(" << HEX((int)t->regs().arg1_signed()) << ")";
           break;
+        case Arch::futex_time64:
         case Arch::futex:
           ss << "; unknown futex("
              << HEX((int)t->regs().arg2_signed() & FUTEX_CMD_MASK) << ")";
@@ -4933,7 +5566,7 @@ static string extra_expected_errno_info(RecordTask* t,
       switch (t->regs().original_syscallno()) {
         case Arch::ptrace:
           ss << "; unsupported ptrace(" << HEX((int)t->regs().arg1()) << " ["
-             << ptrace_req_name((int)t->regs().arg1_signed()) << "])";
+             << ptrace_req_name<Arch>((int)t->regs().arg1_signed()) << "])";
           break;
       }
       break;
@@ -4990,6 +5623,8 @@ static bool is_mapped_shared(RecordTask* t, const struct stat& st) {
       if ((m.map.flags() & MAP_SHARED) &&
           m.mapped_file_stat && m.mapped_file_stat->st_dev == st.st_dev &&
           m.mapped_file_stat->st_ino == st.st_ino) {
+        LOG(debug) << "is_mapped_shared is shared: "
+          << st.st_dev << " " << st.st_ino;
         return true;
       }
     }
@@ -4999,15 +5634,30 @@ static bool is_mapped_shared(RecordTask* t, const struct stat& st) {
 
 // Returns the file path. This could be a blacklisted file so don't
 // do anything for blacklisted files.
-static string handle_opened_file(RecordTask* t, int fd) {
+static string handle_opened_file(RecordTask* t, int fd, int flags) {
   string pathname = t->file_name_of_fd(fd);
   struct stat st = t->stat_fd(fd);
 
   // This must be kept in sync with replay_syscall's handle_opened_files.
   FileMonitor* file_monitor = nullptr;
   if (is_mapped_shared(t, st) && is_writable(t, fd)) {
-    LOG(info) << "Installing MmappedFileMonitor for " << fd;
-    file_monitor = new MmappedFileMonitor(t, fd);
+    // This is quite subtle. Because open(2) is ALLOW_SWITCH, we could have been
+    // descheduled after entering the syscall we're now exiting. If that happened,
+    // and another task did a shared mapping of this file while we were suspended,
+    // it would have trawled the proc filesystem looking for other open fds for
+    // the same file. If this syscall had been completed in the kernel by then,
+    // it will have already installed this monitor for us. So we must allow this
+    // benign race.
+    if (t->fd_table()->is_monitoring(fd)) {
+      LOG(debug) << "Already monitoring " << fd;
+        ASSERT(t,
+               t->fd_table()->get_monitor(fd)->type() ==
+               FileMonitor::Type::Mmapped);
+    } else {
+      // The normal case, we are unmonitored because we are a new file.
+      LOG(info) << "Installing MmappedFileMonitor for " << fd;
+      file_monitor = new MmappedFileMonitor(t, fd);
+    }
   } else if (is_rr_terminal(pathname)) {
     // This will let rr event annotations echo to the terminal. It will also
     // ensure writes to this fd are not syscall-buffered.
@@ -5020,6 +5670,18 @@ static string handle_opened_file(RecordTask* t, int fd) {
   } else if (is_proc_fd_dir(pathname.c_str())) {
     LOG(info) << "Installing ProcFdDirMonitor for " << fd;
     file_monitor = new ProcFdDirMonitor(t, pathname);
+  } else if (is_sys_cpu_online_file(pathname.c_str())) {
+    LOG(info) << "Installing SysCpuMonitor for " << fd;
+    file_monitor = new SysCpuMonitor(t, pathname);
+  } else if (is_proc_stat_file(pathname.c_str())) {
+    LOG(info) << "Installing ProcStatMonitor for " << fd;
+    file_monitor = new ProcStatMonitor(t, pathname);
+  } else if (flags & O_DIRECT) {
+    // O_DIRECT can impose unknown alignment requirements, in which case
+    // syscallbuf records will not be properly aligned and will cause I/O
+    // to fail. Disable syscall buffering for O_DIRECT files.
+    LOG(info) << "Installing FileMonitor for O_DIRECT " << fd;
+    file_monitor = new FileMonitor();
   }
 
   if (file_monitor) {
@@ -5049,7 +5711,7 @@ static void check_scm_rights_fd(RecordTask* t, typename Arch::msghdr& msg) {
       int* fds = static_cast<int*>(Arch::cmsg_data(cmsg));
       int fd_count = (cmsg->cmsg_len - sizeof(*cmsg)) / sizeof(int);
       for (int i = 0; i < fd_count; ++i) {
-        handle_opened_file(t, fds[i]);
+        handle_opened_file(t, fds[i], 0);
       }
     }
     index += Arch::cmsg_align(cmsg->cmsg_len);
@@ -5061,32 +5723,29 @@ static void check_scm_rights_fd(RecordTask* t, typename Arch::msghdr& msg) {
 
 static void fake_gcrypt_file(RecordTask* t, Registers* r) {
   // We hijacked this call to deal with /etc/gcrypt/hwf.deny.
-  TempFile file = create_temporary_file("rr-gcrypt-hwf-deny-XXXXXX");
+  char fname[255];
+  snprintf(fname, sizeof(fname), "rr-gcrypt-hwf-deny-%d", getpid());
+  ScopedFd fd(open_memory_file(fname));
 
   struct stat dummy;
   if (!stat("/etc/gcrypt/hwf.deny", &dummy)) {
     // Copy the contents into our temporary file
     ScopedFd existing("/etc/gcrypt/hwf.deny", O_RDONLY);
-    if (!copy_file(file.fd, existing)) {
+    if (!copy_file(fd, existing)) {
       FATAL() << "Can't copy file";
     }
   }
 
   static const char disable_rdrand[] = "\nintel-rdrand\n";
-  write_all(file.fd, disable_rdrand, sizeof(disable_rdrand) - 1);
+  write_all(fd, disable_rdrand, sizeof(disable_rdrand) - 1);
 
   // Now open the file in the child.
   int child_fd;
   {
     AutoRemoteSyscalls remote(t);
-    AutoRestoreMem child_str(remote, file.name.c_str());
-    child_fd = remote.infallible_syscall(
-        syscall_number_for_openat(remote.arch()), RR_RESERVED_ROOT_DIR_FD,
-        child_str.get(), O_RDONLY);
+    lseek(fd, 0, SEEK_SET);
+    child_fd = remote.send_fd(fd);
   }
-
-  // Unlink it now that the child has opened it.
-  unlink(file.name.c_str());
 
   // And hand out our fake file.
   r->set_syscall_result(child_fd);
@@ -5129,6 +5788,9 @@ static void rec_process_syscall_arch(RecordTask* t,
         << t->regs().syscall_result_signed() << " (errno "
         << errno_name(-t->regs().syscall_result_signed()) << ")"
         << extra_expected_errno_info<Arch>(t, syscall_state);
+    if (syscallno == Arch::execve) {
+      t->session().scheduler().did_exit_execve(t);
+    }
     return;
   }
 
@@ -5139,15 +5801,18 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::fork:
     case Arch::vfork:
     case Arch::clone: {
-      // On a 3.19.0-39-generic #44-Ubuntu kernel we have observed clone()
-      // clearing the parity flag internally.
-      Registers r = t->regs();
-      r.set_flags(syscall_state.syscall_entry_registers.flags());
-      t->set_regs(r);
+      if (Arch::is_x86ish()) {
+        // On a 3.19.0-39-generic #44-Ubuntu kernel we have observed clone()
+        // clearing the parity flag internally.
+        Registers r = t->regs();
+        r.set_flags(syscall_state.syscall_entry_registers.flags());
+        t->set_regs(r);
+      }
       break;
     }
 
     case Arch::execve:
+      t->session().scheduler().did_exit_execve(t);
       process_execve(t, syscall_state);
       if (t->emulated_ptracer) {
         if (t->emulated_ptrace_options & PTRACE_O_TRACEEXEC) {
@@ -5169,15 +5834,15 @@ static void rec_process_syscall_arch(RecordTask* t,
         // get the correct prot bits for heaps. Usually it's READ|WRITE but
         // there seem to be exceptions depending on system settings.
         KernelMapping kernel_info = t->vm()->read_kernel_mapping(t, old_brk);
-        ASSERT(t, km.device() == KernelMapping::NO_DEVICE);
-        ASSERT(t, km.inode() == KernelMapping::NO_INODE);
+        ASSERT(t, kernel_info.device() == KernelMapping::NO_DEVICE);
+        ASSERT(t, kernel_info.inode() == KernelMapping::NO_INODE);
         km = kernel_info.subrange(old_brk, new_brk);
       } else {
         // Write a dummy KernelMapping that indicates an unmap
         km = KernelMapping(new_brk, old_brk, string(), KernelMapping::NO_DEVICE,
                            KernelMapping::NO_INODE, 0, 0, 0);
       }
-      auto d = t->trace_writer().write_mapped_region(t, km, km.fake_stat(), vector<TraceRemoteFd>());
+      auto d = t->trace_writer().write_mapped_region(t, km, km.fake_stat(), km.fsname(), vector<TraceRemoteFd>());
       ASSERT(t, d == TraceWriter::DONT_RECORD_IN_TRACE);
       t->vm()->brk(t, t->regs().syscall_result(), km.prot());
       break;
@@ -5187,14 +5852,14 @@ static void rec_process_syscall_arch(RecordTask* t,
       switch (Arch::mmap_semantics) {
         case Arch::StructArguments: {
           auto args = t->read_mem(
-              remote_ptr<typename Arch::mmap_args>(t->regs().arg1()));
+              remote_ptr<typename Arch::mmap_args>(t->regs().orig_arg1()));
           process_mmap(t, args.len, args.prot, args.flags, args.fd,
                        args.offset / 4096);
           break;
         }
         case Arch::RegisterArguments: {
           Registers r = t->regs();
-          r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+          r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
           r.set_arg4(syscall_state.syscall_entry_registers.arg4_signed());
           t->set_regs(r);
           process_mmap(t, (size_t)r.arg2(), (int)r.arg3_signed(),
@@ -5207,7 +5872,7 @@ static void rec_process_syscall_arch(RecordTask* t,
 
     case Arch::mmap2: {
       Registers r = t->regs();
-      r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
       r.set_arg4(syscall_state.syscall_entry_registers.arg4_signed());
       t->set_regs(r);
       process_mmap(t, (size_t)r.arg2(), (int)r.arg3_signed(),
@@ -5217,16 +5882,16 @@ static void rec_process_syscall_arch(RecordTask* t,
     }
 
     case Arch::mremap:
-      process_mremap(t, t->regs().arg1(), t->regs().arg2(), t->regs().arg3());
+      process_mremap(t, t->regs().orig_arg1(), t->regs().arg2(), t->regs().arg3());
       break;
 
     case Arch::shmat:
-      process_shmat(t, (int)t->regs().arg1_signed(),
+      process_shmat(t, (int)t->regs().orig_arg1_signed(),
                     (int)t->regs().arg3_signed(), t->regs().syscall_result());
       break;
 
     case Arch::ipc:
-      switch ((int)t->regs().arg1_signed()) {
+      switch ((int)t->regs().orig_arg1_signed()) {
         case SHMAT: {
           auto out_ptr = t->read_mem(
               remote_ptr<typename Arch::unsigned_long>(t->regs().arg4()));
@@ -5251,15 +5916,16 @@ static void rec_process_syscall_arch(RecordTask* t,
     }
 
     case Arch::perf_event_open:
-      if (t->regs().original_syscallno() == Arch::inotify_init) {
+      if (t->regs().original_syscallno() == Arch::inotify_init1) {
         ASSERT(t, !t->regs().syscall_failed());
         int fd = t->regs().syscall_result_signed();
         Registers r = t->regs();
         r.set_original_syscallno(
             syscall_state.syscall_entry_registers.original_syscallno());
+        r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
         t->set_regs(r);
         auto attr =
-            t->read_mem(remote_ptr<struct perf_event_attr>(t->regs().arg1()));
+            t->read_mem(remote_ptr<struct perf_event_attr>(t->regs().orig_arg1()));
         t->fd_table()->add_monitor(t,
             fd, new VirtualPerfCounterMonitor(
                     t, t->session().find_task((pid_t)t->regs().arg2_signed()),
@@ -5283,7 +5949,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::openat: {
       Registers r = t->regs();
       if (r.syscall_failed()) {
-        uintptr_t path = syscallno == Arch::openat ? r.arg2() : r.arg1();
+        uintptr_t path = syscallno == Arch::openat ? r.arg2() : r.orig_arg1();
         string pathname = t->read_c_str(remote_ptr<char>(path));
         if (is_gcrypt_deny_file(pathname.c_str())) {
           fake_gcrypt_file(t, &r);
@@ -5291,7 +5957,8 @@ static void rec_process_syscall_arch(RecordTask* t,
         }
       } else {
         int fd = r.syscall_result_signed();
-        string pathname = handle_opened_file(t, fd);
+        int flags = syscallno == Arch::openat ? r.arg3() : r.arg2();
+        string pathname = handle_opened_file(t, fd, flags);
         bool gcrypt = is_gcrypt_deny_file(pathname.c_str());
         if (gcrypt || is_blacklisted_filename(pathname.c_str())) {
           {
@@ -5312,7 +5979,7 @@ static void rec_process_syscall_arch(RecordTask* t,
 
     case SYS_rrcall_notify_control_msg: {
       auto msg =
-          t->read_mem(remote_ptr<typename Arch::msghdr>(t->regs().arg1()));
+          t->read_mem(remote_ptr<typename Arch::msghdr>(t->regs().orig_arg1()));
       check_scm_rights_fd<Arch>(t, msg);
       break;
     }
@@ -5325,6 +5992,7 @@ static void rec_process_syscall_arch(RecordTask* t,
       }
       break;
 
+    case Arch::recvmmsg_time64:
     case Arch::recvmmsg:
       if (!t->regs().syscall_failed()) {
         int msg_count = (int)t->regs().syscall_result_signed();
@@ -5337,7 +6005,7 @@ static void rec_process_syscall_arch(RecordTask* t,
       break;
 
     case Arch::sched_getaffinity: {
-      pid_t pid = (pid_t)t->regs().arg1();
+      pid_t pid = (pid_t)t->regs().orig_arg1();
       if (!t->regs().syscall_failed() && (pid == 0 || pid == t->rec_tid)) {
         if (t->regs().syscall_result() > sizeof(cpu_set_t)) {
           LOG(warn) << "Don't understand kernel's sched_getaffinity result";
@@ -5352,7 +6020,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::setsockopt: {
       // restore possibly-modified regs
       Registers r = t->regs();
-      r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
       t->set_regs(r);
       break;
     }
@@ -5364,13 +6032,13 @@ static void rec_process_syscall_arch(RecordTask* t,
         // `connect` was suppressed
         r.set_syscall_result(-EACCES);
       }
-      r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
       r.set_original_syscallno(
           syscall_state.syscall_entry_registers.original_syscallno());
       t->set_regs(r);
 
       if (!t->regs().syscall_failed()) {
-        switch ((int)t->regs().arg1_signed()) {
+        switch ((int)t->regs().orig_arg1_signed()) {
           case SYS_RECVMSG: {
             auto args = t->read_mem(
                 remote_ptr<typename Arch::recvmsg_args>(t->regs().arg2()));
@@ -5398,7 +6066,7 @@ static void rec_process_syscall_arch(RecordTask* t,
       break;
 
     case Arch::process_vm_writev: {
-      RecordTask* dest = t->session().find_task(t->regs().arg1());
+      RecordTask* dest = t->session().find_task(t->regs().orig_arg1());
       if (dest) {
         record_iovec_output<Arch>(t, dest, t->regs().arg4(), t->regs().arg5());
       }
@@ -5410,6 +6078,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::dup3:
     case Arch::fcntl:
     case Arch::fcntl64:
+    case Arch::futex_time64:
     case Arch::futex:
     case Arch::ioctl:
     case Arch::io_setup:
@@ -5424,7 +6093,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::mprotect: {
       // Restore the registers that we may have altered.
       Registers r = t->regs();
-      r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
       r.set_arg2(syscall_state.syscall_entry_registers.arg2());
       r.set_arg3(syscall_state.syscall_entry_registers.arg3());
       t->set_regs(r);
@@ -5434,7 +6103,7 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::getdents:
     case Arch::getdents64: {
       Registers r = t->regs();
-      int fd = r.arg1();
+      int fd = r.orig_arg1();
       t->fd_table()->filter_getdents(fd, t);
       break;
     }
@@ -5445,7 +6114,7 @@ static void rec_process_syscall_arch(RecordTask* t,
       t->in_wait_type = WAIT_TYPE_NONE;
       // Restore possibly-modified registers
       Registers r = t->regs();
-      r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
       r.set_arg2(syscall_state.syscall_entry_registers.arg2());
       r.set_arg3(syscall_state.syscall_entry_registers.arg3());
       r.set_arg4(syscall_state.syscall_entry_registers.arg4());
@@ -5457,7 +6126,7 @@ static void rec_process_syscall_arch(RecordTask* t,
       if (tracee) {
         // Finish emulation of ptrace result or stop-signal
         Registers r = t->regs();
-        r.set_syscall_result(tracee->tid);
+        r.set_syscall_result(syscallno == Arch::waitid ? 0 : tracee->tid);
         t->set_regs(r);
         if (syscallno == Arch::waitid) {
           remote_ptr<typename Arch::siginfo_t> sip = r.arg3();
@@ -5477,18 +6146,6 @@ static void rec_process_syscall_arch(RecordTask* t,
         if (syscallno == Arch::waitid && (r.arg4() & WNOWAIT)) {
           // Leave the child in a waitable state
         } else {
-          if (tracee->emulated_stop_code.exit_code() >= 0) {
-            // If we stopped the tracee to deliver this notification,
-            // now allow it to continue to exit properly and notify its
-            // real parent.
-            ASSERT(t,
-                   tracee->ev().is_syscall_event() &&
-                       PROCESSING_SYSCALL == tracee->ev().Syscall().state &&
-                       tracee->stable_exit);
-            // Continue the task since we didn't in enter_syscall
-            tracee->resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING,
-                                     RESUME_NO_TICKS);
-          }
           if (tracee->emulated_ptracer == t) {
             tracee->emulated_stop_pending = false;
           } else {
@@ -5498,6 +6155,13 @@ static void rec_process_syscall_arch(RecordTask* t,
             }
           }
         }
+        if (tracee->waiting_for_reap) {
+          if (tracee->waiting_for_zombie) {
+            tracee->waiting_for_reap = false;
+          } else {
+            delete tracee;
+          }
+        }
       }
       break;
     }
@@ -5505,9 +6169,9 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::prctl: {
       // Restore arg1 in case we modified it to disable the syscall
       Registers r = t->regs();
-      r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
       t->set_regs(r);
-      switch ((int)t->regs().arg1()) {
+      switch ((int)t->regs().orig_arg1()) {
         case PR_SET_SECCOMP:
           if (t->session().done_initial_exec()) {
             t->session()
@@ -5523,13 +6187,13 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::arch_prctl: {
       // Restore arg1 in case we modified it to disable the syscall
       Registers r = t->regs();
-      r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
       t->set_regs(r);
       break;
     }
 
     case Arch::quotactl:
-      switch (t->regs().arg1() >> SUBCMDSHIFT) {
+      switch (t->regs().orig_arg1() >> SUBCMDSHIFT) {
         case Q_GETQUOTA:
         case Q_GETINFO:
         case Q_GETFMT:
@@ -5554,9 +6218,9 @@ static void rec_process_syscall_arch(RecordTask* t,
     case Arch::seccomp: {
       // Restore arg1 in case we modified it to disable the syscall
       Registers r = t->regs();
-      r.set_arg1(syscall_state.syscall_entry_registers.arg1());
+      r.set_orig_arg1(syscall_state.syscall_entry_registers.arg1());
       t->set_regs(r);
-      if (t->regs().arg1() == SECCOMP_SET_MODE_FILTER) {
+      if (t->regs().orig_arg1() == SECCOMP_SET_MODE_FILTER) {
         ASSERT(t, t->session().done_initial_exec())
             << "no seccomp calls during spawn";
         t->session()
@@ -5605,6 +6269,12 @@ static void rec_process_syscall_internal(RecordTask* t, SupportedArch arch,
   RR_ARCH_FUNCTION(rec_process_syscall_arch, arch, t, syscall_state)
 }
 
+void rec_did_sigreturn(RecordTask *t) {
+  auto& syscall_state = *syscall_state_property.get(*t);
+  aarch64_kernel_bug_workaround(t, syscall_state);
+  syscall_state_property.remove(*t);
+}
+
 void rec_process_syscall(RecordTask* t) {
   auto& syscall_state = *syscall_state_property.get(*t);
   const SyscallEvent& sys_ev = t->ev().Syscall();
@@ -5618,6 +6288,9 @@ void rec_process_syscall(RecordTask* t) {
   }
   rec_process_syscall_internal(t, sys_ev.arch(), syscall_state);
   syscall_state.process_syscall_results();
+
+  aarch64_kernel_bug_workaround(t, syscall_state);
+
   t->on_syscall_exit(sys_ev.number, sys_ev.arch(), t->regs());
   syscall_state_property.remove(*t);
 

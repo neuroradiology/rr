@@ -20,6 +20,10 @@
 #include <sys/user.h>
 #include <unistd.h>
 
+#ifndef F_GETPIPE_SZ
+#define F_GETPIPE_SZ 1032
+#endif
+
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -196,11 +200,19 @@ static uint64_t file_offset(int fd) {
   return offset;
 }
 
+size_t page_size(void) {
+  static size_t size = 0;
+  if (!size) {
+    size = sysconf(_SC_PAGE_SIZE);
+  }
+  return size;
+}
+
 static uint64_t pad_output_to_page_size(int fd) {
-  char buf[PAGE_SIZE];
+  char *buf = alloca(page_size());
   uint64_t offset = file_offset(fd);
-  memset(buf, 0, sizeof(buf));
-  ssize_t pad = ((offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)) - offset;
+  memset(buf, 0, page_size());
+  ssize_t pad = ((offset + page_size() - 1) & ~(page_size() - 1)) - offset;
   check(pad == write(fd, buf, pad));
   return offset + pad;
 }
@@ -212,7 +224,7 @@ static void write_final_output(void) {
                                                                   */
                                 0, /* little-endian */
                                 sizeof(long) };
-  const uint32_t page_size = PAGE_SIZE;
+  const uint32_t psize = page_size();
   uint32_t ftrace_count;
   static const uint32_t zero = 0;
   static const uint32_t cpus = 1;
@@ -227,7 +239,7 @@ static void write_final_output(void) {
   check(final_fd >= 0);
 
   check(sizeof(magic) == write(final_fd, magic, sizeof(magic)));
-  check(sizeof(page_size) == write(final_fd, &page_size, sizeof(page_size)));
+  check(sizeof(psize) == write(final_fd, &psize, sizeof(psize)));
 
   copy_trace_file_with_name(final_fd, "events/header_page", 8);
   copy_trace_file_with_name(final_fd, "events/header_event", 8);

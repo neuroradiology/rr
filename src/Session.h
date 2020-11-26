@@ -14,6 +14,7 @@
 #include "MonitoredSharedMemory.h"
 #include "TaskishUid.h"
 #include "TraceStream.h"
+#include "preload/preload_interface.h"
 
 namespace rr {
 
@@ -324,12 +325,44 @@ public:
   static const char* rr_mapping_prefix();
 
   ScopedFd& tracee_socket_fd() { return *tracee_socket; }
+  ScopedFd& tracee_socket_receiver_fd() { return *tracee_socket_receiver; }
   int tracee_fd_number() const { return tracee_socket_fd_number; }
 
   virtual TraceStream* trace_stream() { return nullptr; }
   TicksSemantics ticks_semantics() const { return ticks_semantics_; }
 
   virtual int cpu_binding(TraceStream& trace) const;
+
+  int syscall_number_for_rrcall_init_preload() const {
+    return SYS_rrcall_init_preload - RR_CALL_BASE + rrcall_base_;
+  }
+  int syscall_number_for_rrcall_init_buffers() const {
+    return SYS_rrcall_init_buffers - RR_CALL_BASE + rrcall_base_;
+  }
+  int syscall_number_for_rrcall_notify_syscall_hook_exit() const {
+    return SYS_rrcall_notify_syscall_hook_exit - RR_CALL_BASE + rrcall_base_;
+  }
+  int syscall_number_for_rrcall_notify_control_msg() const {
+    return SYS_rrcall_notify_control_msg - RR_CALL_BASE + rrcall_base_;
+  }
+  int syscall_number_for_rrcall_reload_auxv() const {
+    return SYS_rrcall_reload_auxv - RR_CALL_BASE + rrcall_base_;
+  }
+  int syscall_number_for_rrcall_mprotect_record() const {
+    return SYS_rrcall_mprotect_record - RR_CALL_BASE + rrcall_base_;
+  }
+  int syscall_number_for_rrcall_notify_stap_semaphore_added() const {
+    return SYS_rrcall_notify_stap_semaphore_added - RR_CALL_BASE + rrcall_base_;
+  }
+  int syscall_number_for_rrcall_notify_stap_semaphore_removed() const {
+    return SYS_rrcall_notify_stap_semaphore_removed - RR_CALL_BASE + rrcall_base_;
+  }
+
+  /* Bind the current process to the a CPU as specified in the session options
+     or trace */
+  void do_bind_cpu(TraceStream &trace);
+
+  const ThreadGroupMap& thread_group_map() const { return thread_group_map_; }
 
 protected:
   Session();
@@ -356,7 +389,9 @@ protected:
 
   AddressSpaceMap vm_map;
   TaskMap task_map;
-  ThreadGroupMap thread_group_map;
+  ThreadGroupMap thread_group_map_;
+
+  ScopedFd cpu_lock;
 
   // If non-null, data required to finish initializing the tasks of this
   // session.
@@ -365,10 +400,12 @@ protected:
   Statistics statistics_;
 
   std::shared_ptr<ScopedFd> tracee_socket;
+  std::shared_ptr<ScopedFd> tracee_socket_receiver;
   int tracee_socket_fd_number;
   uint32_t next_task_serial_;
   ScopedFd spawned_task_error_fd_;
 
+  int rrcall_base_;
   PtraceSyscallBeforeSeccomp syscall_seccomp_ordering_;
 
   TicksSemantics ticks_semantics_;

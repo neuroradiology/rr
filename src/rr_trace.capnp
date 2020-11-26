@@ -40,6 +40,12 @@ enum TicksSemantics {
   takenBranches @1;
 }
 
+enum CpuTriState {
+  unknown @0;
+  knownTrue @1;
+  knownFalse @2;
+}
+
 # The 'version' file contains an ASCII version number followed by a newline.
 # The version number is currently 85 and increments only when there's a
 # backwards-incompatible change. See TRACE_VERSION.
@@ -52,15 +58,6 @@ struct Header {
   # The CPU number the trace was bound to during recording, or -1 if it
   # wasn't bound.
   bindToCpu @1 :Int32;
-  # True if the trace used CPUID faulting during recording (so CPUIDs
-  # were recorded as InstructionTraps).
-  hasCpuidFaulting @2 :Bool;
-  # A list of captured CPUID values.
-  # A series of 24-byte records. See CPUIDRecord in util.h.
-  cpuidRecords @3 :Data;
-  # Captured XCR0 value defining XSAVE features enabled by OS.
-  # 0 means "unknown"; default to everything supported by CPUID EAX=0xd ECX=0
-  xcr0 @5 :UInt64;
   # Semantics of "ticks" in this trace
   ticksSemantics @6 :TicksSemantics;
   # The syscallbuf protocol version. See SYSCALLBUF_PROTOCOL_VERSION.
@@ -69,6 +66,33 @@ struct Header {
   ok @7 :Bool = true;
   # Do the mappings of preload_thread_locals always appear in the trace?
   preloadThreadLocalsRecorded @8 :Bool = false;
+  # Base rr syscall number (rrcall_init_preload). Before this was variable,
+  # it was 442.
+  rrcallBase @9 :Int32 = 442;
+  nativeArch @10 :Arch = x8664;
+  # Architecture specific data, determined by nativeArch
+  x86 :group {
+    # True if the trace used CPUID faulting during recording (so CPUIDs
+    # were recorded as InstructionTraps).
+    hasCpuidFaulting @2 :Bool;
+    # A list of captured CPUID values.
+    # A series of 24-byte records. See CPUIDRecord in util.h.
+    cpuidRecords @3 :Data;
+    # Captured XCR0 value defining XSAVE features enabled by OS.
+    # 0 means "unknown"; default to everything supported by CPUID EAX=0xd ECX=0
+    xcr0 @5 :UInt64;
+    # Whether XSAVE instructions write FIP/FDP when there is no pending x87 exception
+    # rr itself doesn't use this yet.
+    xsaveFipFdpQuirk @12 :CpuTriState = unknown;
+    # Whether FDP is written only when an x87 instruction raises an unmasked exception
+    # rr itself doesn't use this yet.
+    fdpExceptionOnlyQuirk @13 :CpuTriState = unknown;
+    # rr sets FIP/FDP to zero at each recorded event.
+    clearFipFdp @14 :Bool = false;
+  }
+  # Whether the version of rr that recorded this, explicitly recorded
+  # modifications made through /proc/<pid>/<mem>
+  explicitProcMem @11 :Bool = true;
 }
 
 # A file descriptor belonging to a task
@@ -146,6 +170,9 @@ struct TaskEvent {
     exit :group {
       exitStatus @7 :Int32;
     }
+    detach :group {
+      none @9 :Void;
+    }
   }
 }
 
@@ -158,6 +185,7 @@ struct MemWrite {
 enum Arch {
   x86 @0;
   x8664 @1;
+  aarch64 @2;
 }
 
 struct Registers {
@@ -211,7 +239,9 @@ struct Frame {
   # Per-task total tick count.
   ticks @1 :Ticks;
   # The baseline is unspecified, so only the differences between frames'
-  # values are meaningful
+  # values are meaningful.
+  # The time is the time this record was written, i.e. after the execution
+  # of this frame completed.
   monotonicSec @2 :Float64;
   # Userspace writes performed by this event
   memWrites @3 :List(MemWrite);
@@ -253,5 +283,7 @@ struct Frame {
         openedFds @25 :List(OpenedFd);
       }
     }
+    patchAfterSyscall @26: Void;
+    patchVsyscall @27: Void;
   }
 }

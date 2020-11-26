@@ -3,6 +3,7 @@
 #include "EmuFs.h"
 
 #include <syscall.h>
+#include <sys/mman.h>
 
 #include <fstream>
 #include <sstream>
@@ -18,13 +19,6 @@
 using namespace std;
 
 namespace rr {
-
-static void replace_char(string& s, char c, char replacement) {
-  size_t i;
-  while (string::npos != (i = s.find(c))) {
-    s[i] = replacement;
-  }
-}
 
 EmuFile::~EmuFile() {
   LOG(debug) << "    EmuFs::~File(einode:" << inode_ << ")";
@@ -77,35 +71,34 @@ void EmuFile::ensure_size(uint64_t size) {
   }
 }
 
+std::string make_temp_name(const string& orig_path, dev_t orig_device,
+                           ino_t orig_inode)
+{
+  stringstream name;
+  name << "rr-emufs-" << getpid() << "-dev-" << orig_device
+       << "-inode-" << orig_inode << "-" << orig_path;
+  // The linux man page for memfd_create says the length limit for the name
+  // argument is 249 bytes, evidently because it prepends "memfd:" to the
+  // parameter before using it.
+  return name.str().substr(0, 249);
+}
+
 /*static*/ EmuFile::shr_ptr EmuFile::create(EmuFs& owner,
                                             const string& orig_path,
                                             dev_t orig_device, ino_t orig_inode,
                                             uint64_t orig_file_size) {
-  // Sanitize the mapped file path so that we can use it in a
-  // leaf name.
-  string path_tag(orig_path);
-  replace_char(path_tag, '/', '\\');
-
-  stringstream name;
-  name << tmp_dir() << "/rr-emufs-" << getpid() << "-dev-" << orig_device
-       << "-inode-" << orig_inode << "-" << path_tag;
-  string real_name = name.str().substr(0, 255);
-
-  ScopedFd fd =
-      open(real_name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0700);
+  string real_name = make_temp_name(orig_path, orig_device, orig_inode);
+  ScopedFd fd(open_memory_file(real_name));
   if (!fd.is_open()) {
-    FATAL() << "Failed to create shmem segment " << real_name;
+    FATAL() << "Failed to create shmem segment for " << real_name;
   }
-  /* Remove the fs name so that we don't have to worry about
-   * cleaning up this segment in error conditions. */
-  unlink(real_name.c_str());
   resize_shmem_segment(fd, orig_file_size);
 
   shr_ptr f(new EmuFile(owner, std::move(fd), orig_path, real_name, orig_device,
                         orig_inode, orig_file_size));
 
   LOG(debug) << "created emulated file for " << orig_path << " as "
-             << name.str();
+             << real_name;
   return f;
 }
 
@@ -172,7 +165,10 @@ void EmuFs::log() const {
 
 EmuFs::EmuFs() {}
 
-EmuFs::FileId::FileId(const KernelMapping& recorded_map)
+FileId::FileId(const KernelMapping& recorded_map)
     : device(recorded_map.device()), inode(recorded_map.inode()) {}
+
+FileId::FileId(const EmuFile& emu_file)
+    : device(emu_file.device()), inode(emu_file.inode()) {}
 
 } // namespace rr

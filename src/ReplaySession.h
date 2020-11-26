@@ -12,6 +12,7 @@
 #include "EmuFs.h"
 #include "Session.h"
 #include "Task.h"
+#include "fast_forward.h"
 
 struct syscallbuf_hdr;
 
@@ -25,8 +26,8 @@ class ReplayTask;
  * per-Session data.
  */
 struct ReplayFlushBufferedSyscallState {
-  /* An internal breakpoint is set at this address */
-  uintptr_t stop_breakpoint_addr;
+  /* The offset in the syscallbuf (in 8-byte units) at which we want to stop */
+  uintptr_t stop_breakpoint_offset;
 };
 
 /**
@@ -57,6 +58,12 @@ enum ReplayTraceStepType {
 
   /* Replay until we enter the next syscall, then patch it. */
   TSTEP_PATCH_SYSCALL,
+
+  /* Replay until we exit the next syscall, then patch it. */
+  TSTEP_PATCH_AFTER_SYSCALL,
+
+  /* Replay until we hit the ip recorded in the event, then patch the vsyscall caller. */
+  TSTEP_PATCH_VSYSCALL,
 
   /* Exit the task */
   TSTEP_EXIT_TASK,
@@ -106,6 +113,10 @@ struct ReplayResult {
   // break_status.singlestep_complete might indicate the completion of more
   // than one instruction.
   bool did_fast_forward;
+  // True if we fast-forward-singlestepped a string instruction but it has at least
+  // one iteration to go. did_fast_forward may be false in this case if the
+  // instruction executes exactly twice.
+  bool incomplete_fast_forward;
 };
 
 /**
@@ -275,6 +286,8 @@ public:
 
   virtual ReplaySession* as_replay() override { return this; }
 
+  SupportedArch arch() { return trace_in.arch(); }
+
   /**
    * Return true if |sig| is a signal that may be generated during
    * replay but should be ignored.  For example, SIGCHLD can be
@@ -300,6 +313,8 @@ public:
   virtual TraceStream* trace_stream() override { return &trace_in; }
 
   virtual int cpu_binding(TraceStream& trace) const override;
+
+  bool explicit_proc_mem() { return trace_in.explicit_proc_mem(); }
 
 private:
   ReplaySession(const std::string& dir, const Flags& flags);
@@ -334,7 +349,9 @@ private:
   Completion flush_syscallbuf(ReplayTask* t,
                               const StepConstraints& constraints);
   Completion patch_next_syscall(ReplayTask* t,
-                                const StepConstraints& constraints);
+                                const StepConstraints& constraints,
+                                bool before_syscall);
+  Completion patch_vsyscall(ReplayTask* t, const StepConstraints& constraints);
   void check_approaching_ticks_target(ReplayTask* t,
                                       const StepConstraints& constraints,
                                       BreakStatus& break_status);
@@ -349,7 +366,7 @@ private:
   CPUIDBugDetector cpuid_bug_detector;
   siginfo_t last_siginfo_;
   Flags flags_;
-  bool did_fast_forward;
+  FastForwardStatus fast_forward_status;
 
   // The clock_gettime(CLOCK_MONOTONIC) timestamp of the first trace event, used
   // during 'replay' to calculate the elapsed time between the first event and

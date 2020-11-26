@@ -105,33 +105,31 @@ class RRCmd(gdb.Command):
         response = gdb_unescape(rv_match.group(1))
         gdb.write(response)
 
-
-class RRRunC(gdb.Command):
-  """Helper to run code for different language environments always in c"""
-  def __init__(self):
-    gdb.Command.__init__(self, 'rr-run-c',
-                       gdb.COMMAND_USER, gdb.COMPLETE_NONE, False)
-
-  def invoke(self, arg, from_tty):
-    # sorry, the whole parsing function is not very robust
-    # not sure how to improve: maybe gdb spec/see source if this is ok
-    # The current source language is 
-    output = gdb.execute('show lang', False, True)
-    start = output.find('"')
-    end = output.find('"', start + 1)
-    user_lang = output[start + 1 : end]
-    if user_lang.startswith('auto;'): # auto currently name
-      user_lang = 'auto'
-    if arg and arg[0] == '"' and arg[-1] == '"':
-      arg = arg[1:-1].replace('\\n', '\n')
-    gdb.execute('set lang c')
-    gdb.execute(arg)
-    gdb.execute('set lang %s' % user_lang)
-
-RRRunC()
-
 def history_push(p):
     gdb.execute("rr-history-push", to_string=True)
+
+rr_suppress_run_hook = False
+
+class RRHookRun(gdb.Command):
+    def __init__(self):
+        gdb.Command.__init__(self, 'rr-hook-run',
+                             gdb.COMMAND_USER, gdb.COMPLETE_NONE, False)
+        
+    def invoke(self, arg, from_tty):  
+      thread = int(gdb.parse_and_eval("$_thread"))
+      if thread != 0 and not rr_suppress_run_hook:
+        gdb.execute("stepi")
+     
+class RRSetSuppressRunHook(gdb.Command):
+    def __init__(self):
+        gdb.Command.__init__(self, 'rr-set-suppress-run-hook',
+                             gdb.COMMAND_USER, gdb.COMPLETE_NONE, False)
+        
+    def invoke(self, arg, from_tty):
+      rr_suppress_run_hook = arg == '1'
+
+RRHookRun()
+RRSetSuppressRunHook()
 
 #Automatically push an history entry when the program execution stops
 #(signal, breakpoint).This is fired before an interactive prompt is shown.

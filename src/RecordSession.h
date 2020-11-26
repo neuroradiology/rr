@@ -67,7 +67,10 @@ public:
       unsigned char syscallbuf_desched_sig = SIGPWR,
       BindCPU bind_cpu = BIND_CPU,
       const std::string& output_trace_dir = "",
-      const TraceUuid* trace_id = nullptr);
+      const TraceUuid* trace_id = nullptr,
+      bool use_audit = false,
+      bool unmap_vdso = false,
+      bool force_asan_active = false);
 
   const DisableCPUIDFeatures& disable_cpuid_features() const {
     return disable_cpuid_features_;
@@ -83,6 +86,8 @@ public:
   int get_continue_through_sig() const { return continue_through_sig; }
   void set_asan_active(bool active) { asan_active_ = active; }
   bool asan_active() const { return asan_active_; }
+  bool use_audit() const { return use_audit_; }
+  bool unmap_vdso() { return unmap_vdso_; }
   uint64_t rr_signal_mask() const;
 
   enum RecordStatus {
@@ -168,6 +173,8 @@ public:
   RecordTask* find_task(pid_t rec_tid) const;
   RecordTask* find_task(const TaskUid& tuid) const;
 
+  void on_proxy_detach(RecordTask *t, pid_t new_tid);
+
   /**
    * This gets called when we detect that a task has been revived from the
    * dead with a PTRACE_EVENT_EXEC. See ptrace man page under "execve(2) under
@@ -181,6 +188,12 @@ public:
 
   virtual TraceStream* trace_stream() override { return &trace_out; }
 
+  /**
+   * Like kill_all_tasks, but makes sure to record the exits of the task we
+   * killed.
+   */
+  void kill_all_record_tasks();
+
 private:
   RecordSession(const std::string& exe_path,
                 const std::vector<std::string>& argv,
@@ -190,7 +203,9 @@ private:
                 int syscallbuf_desched_sig,
                 BindCPU bind_cpu,
                 const std::string& output_trace_dir,
-                const TraceUuid* trace_id);
+                const TraceUuid* trace_id,
+                bool use_audit,
+                bool unmap_vdso);
 
   virtual void on_create(Task* t) override;
 
@@ -209,7 +224,7 @@ private:
   void runnable_state_changed(RecordTask* t, StepState* step_state,
                               RecordResult* step_result,
                               bool can_consume_wait_status);
-  void signal_state_changed(RecordTask* t, StepState* step_state);
+  bool signal_state_changed(RecordTask* t, StepState* step_state);
   void syscall_state_changed(RecordTask* t, StepState* step_state);
   void desched_state_changed(RecordTask* t);
   bool prepare_to_inject_signal(RecordTask* t, StepState* step_state);
@@ -243,6 +258,9 @@ private:
   bool wait_for_all_;
 
   std::string output_trace_dir;
+
+  bool use_audit_;
+  bool unmap_vdso_;
 };
 
 } // namespace rr

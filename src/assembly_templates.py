@@ -22,6 +22,25 @@ class Field(object):
         types = { 8: 'uint64_t', 4: 'uint32_t', 2: 'uint16_t', 1: 'uint8_t' }
         return types[self.byte_length]
 
+class ShiftField(object):
+    """A field embedded at some bit shift offset in another object."""
+    def __init__(self, parent, shift, name, byte_length):
+        self.parent = parent
+        self.shift = shift
+        self.name = name
+        self.byte_length = byte_length
+
+    def __len__(self):
+        return len(self.parent)
+
+    def c_type(self):
+        types = { 8: 'uint64_t', 4: 'uint32_t', 2: 'uint16_t', 1: 'uint8_t' }
+        return types[self.byte_length]
+
+    def patch_c_type(self):
+        types = { 8: 'uint64_t', 4: 'uint32_t', 2: 'uint16_t', 1: 'uint8_t' }
+        return types[len(self.parent)]
+
 class AssemblyTemplate(object):
     """A sequence of RawBytes and Field objects, which can be used to verify
     that a given sequence of assembly instructions matches the RawBytes while
@@ -33,7 +52,7 @@ class AssemblyTemplate(object):
         merged_chunks = []
         current_raw_bytes = []
         for c in chunks:
-            if isinstance(c, Field):
+            if isinstance(c, Field) or isinstance(c, ShiftField):
                 # Push any raw bytes before this.
                 if current_raw_bytes:
                     merged_chunks.append(RawBytes(*current_raw_bytes))
@@ -47,13 +66,15 @@ class AssemblyTemplate(object):
         self.chunks = merged_chunks
 
     def fields(self):
-        return [c for c in self.chunks if isinstance(c, Field)]
+        return [c for c in self.chunks if (isinstance(c, Field) or isinstance(c, ShiftField))]
 
     def bytes(self):
         bytes = []
         for c in self.chunks:
             if isinstance(c, Field):
                 bytes.extend([0] * len(c))
+            elif isinstance(c, ShiftField):
+                bytes.extend(c.parent.bytes)
             else:
                 bytes.extend(c.bytes)
         return bytes
@@ -83,14 +104,19 @@ templates = {
         Field('syscall_hook_trampoline', 4),
     ),
     'X86VsyscallMonkeypatch': AssemblyTemplate(
-        RawBytes(0x53),         # push %ebx
         RawBytes(0xb8),         # mov $syscall_number,%eax
         Field('syscall_number', 4),
+        RawBytes(0xe8),         # call $X86VsyscallMonkeypatchShared
+        Field('vsyscall_monkeypatch_shared', 4),
+        RawBytes(0xc3),
+    ),
+    'X86VsyscallMonkeypatchShared': AssemblyTemplate(
         # __vdso functions use the C calling convention, so
         # we have to set up the syscall parameters here.
         # No x86-32 __vdso functions take more than two parameters.
-        RawBytes(0x8b, 0x5c, 0x24, 0x08), # mov 0x8(%esp),%ebx
-        RawBytes(0x8b, 0x4c, 0x24, 0x0c), # mov 0xc(%esp),%ecx
+        RawBytes(0x53),         # push %ebx
+        RawBytes(0x8b, 0x5c, 0x24, 0x0c), # mov 12(%esp),%ebx
+        RawBytes(0x8b, 0x4c, 0x24, 0x10), # mov 16(%esp),%ecx
         RawBytes(0xcd, 0x80),   # int $0x80
         # pad with NOPs to make room to dynamically patch the syscall
         # with a call to the preload library, once syscall buffering
@@ -172,6 +198,29 @@ templates = {
         RawBytes(0xe9),                   # jmp $relative_addr
         Field('relative_addr', 4),
     ),
+    'X64EndBr': AssemblyTemplate(
+        RawBytes(0xf3, 0x0f, 0x1e, 0xfa)
+    ),
+    'X86EndBr': AssemblyTemplate(
+        RawBytes(0xf3, 0x0f, 0x1e, 0xfb)
+    ),
+    'X64VSyscallEntry': AssemblyTemplate(
+        RawBytes(0x48, 0xc7, 0xc0), # movq $[addr], %rax
+        Field('addr', 4),
+        RawBytes(0xff, 0xd0) # callq *%rax
+    ),
+    'X64VSyscallReplacement': AssemblyTemplate(
+        RawBytes(0x48, 0xc7, 0xc0), # movq $[syscallno], %rax
+        Field('syscallno', 4),
+        RawBytes(0x0f, 0x05) # syscall
+    ),
+    'ARM64VdsoMonkeypatch': AssemblyTemplate(
+        ShiftField(
+            RawBytes(0x08, 0x00, 0x80, 0xd2),   # movz x8, #0
+            5, 'syscall_number', 2),
+        RawBytes(0x01, 0x00, 0x00, 0xd4),   # svc #0
+        RawBytes(0xc0, 0x03, 0x5f, 0xd6),   # ret
+    ),
 }
 
 def byte_array_name(name):
@@ -184,7 +233,7 @@ def generate_match_method(byte_array, template):
     field_names = [f.name for f in fields]
     args = ', ' + ', '.join("%s* %s" % (t, n) for t, n in zip(field_types, field_names)) \
            if fields else ''
-    
+
     s.write('  static bool match(const uint8_t* buffer %s) {\n' % (args,))
     offset = 0
     for chunk in template.chunks:
@@ -192,6 +241,9 @@ def generate_match_method(byte_array, template):
             field_name = chunk.name
             s.write('    memcpy(%s, &buffer[%d], sizeof(*%s));\n'
                     % (field_name, offset, field_name))
+        elif isinstance(chunk, ShiftField):
+            s.write('    (void)%s;' % chunk.name)
+            s.write('    assert(0 && "Matching not implemented for ShiftField");')
         else:
             s.write('    if (memcmp(&buffer[%d], &%s[%d], %d) != 0) { return false; }\n'
                     % (offset, byte_array, offset, len(chunk)))
@@ -200,6 +252,23 @@ def generate_match_method(byte_array, template):
     s.write('  }')
     return s.getvalue()
 
+def generate_substitute_chunk(s, chunk, byte_array, offset):
+    if isinstance(chunk, Field):
+        field_name = chunk.name
+        s.write('    memcpy(&buffer[%d], &%s, sizeof(%s));\n'
+                % (offset, field_name, field_name))
+    elif isinstance(chunk, ShiftField):
+        generate_substitute_chunk(s, chunk.parent, byte_array, offset);
+        typ = chunk.patch_c_type()
+        field_name = chunk.name
+        s.write('    *((%s*)&buffer[%d]) |= (((%s)%s)<<%d);\n'
+                % (typ, offset, typ, field_name, chunk.shift))
+    else:
+        s.write('    memcpy(&buffer[%d], &%s[%d], %d);\n'
+                % (offset, byte_array, offset, len(chunk)))
+    offset += len(chunk)
+    return offset
+
 def generate_substitute_method(byte_array, template):
     s = StringIO()
     fields = template.fields()
@@ -207,18 +276,11 @@ def generate_substitute_method(byte_array, template):
     field_names = [f.name for f in fields]
     args = ', ' + ', '.join("%s %s" % (t, n) for t, n in zip(field_types, field_names)) \
            if fields else ''
-    
+
     s.write('  static void substitute(uint8_t* buffer %s) {\n' % (args,))
     offset = 0
     for chunk in template.chunks:
-        if isinstance(chunk, Field):
-            field_name = chunk.name
-            s.write('    memcpy(&buffer[%d], &%s, sizeof(%s));\n'
-                    % (offset, field_name, field_name))
-        else:
-            s.write('    memcpy(&buffer[%d], &%s[%d], %d);\n'
-                    % (offset, byte_array, offset, len(chunk)))
-        offset += len(chunk)
+        offset = generate_substitute_chunk(s, chunk, byte_array, offset)
     s.write('  }')
     return s.getvalue()
 

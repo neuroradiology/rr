@@ -17,7 +17,6 @@
 #include <sys/mount.h>
 
 #include <arpa/inet.h>
-#include <asm/prctl.h>
 #include <assert.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -39,6 +38,7 @@
 #include <linux/if_tun.h>
 #include <linux/limits.h>
 #include <linux/mtio.h>
+#include <linux/netlink.h>
 #include <linux/perf_event.h>
 #include <linux/personality.h>
 #include <linux/random.h>
@@ -102,12 +102,19 @@
 #include <ucontext.h>
 #include <unistd.h>
 #include <utime.h>
+
+// X86 specific headers
+#if defined(__i386__) || defined(__x86_64__)
+#include <asm/prctl.h>
 #include <x86intrin.h>
+#endif
 
 #if defined(__i386__)
 #include "SyscallEnumsForTestsX86.generated"
 #elif defined(__x86_64__)
 #include "SyscallEnumsForTestsX64.generated"
+#elif defined(__aarch64__)
+#include "SyscallEnumsForTestsGeneric.generated"
 #else
 #error Unknown architecture
 #endif
@@ -117,6 +124,10 @@
 typedef unsigned char uint8_t;
 
 #define ALEN(_a) (sizeof(_a) / sizeof(_a[0]))
+
+#ifndef SOL_NETLINK
+#define SOL_NETLINK 270
+#endif
 
 /**
  * Allocate new memory of |size| in bytes. The pointer returned is never NULL.
@@ -167,7 +178,15 @@ inline static int check_cond(int cond) {
   return cond;
 }
 
-#define test_assert(cond) assert("FAILED: !" && check_cond(cond))
+inline static int atomic_assert(int cond, const char *str) {
+  if (!check_cond(cond)) {
+    atomic_printf("FAILED: !%s\n", str);
+    raise(SIGABRT);
+  }
+  return 1;
+}
+
+#define test_assert(cond) atomic_assert(cond, #cond)
 
 /**
  * Return the calling task's id.
@@ -179,14 +198,21 @@ inline static pid_t sys_gettid(void) { return syscall(SYS_gettid); }
  * replay.
  */
 inline static void check_data(void* buf, size_t len) {
-  syscall(SYS_write, RR_MAGIC_SAVE_DATA_FD, buf, len);
-  atomic_printf("Wrote %zu bytes to magic fd\n", len);
+  ssize_t ret = syscall(SYS_write, RR_MAGIC_SAVE_DATA_FD, buf, len);
+  if (ret == -1 && errno == EBADF) {
+    atomic_printf("Failed to write to RR_MAGIC_SAVE_DATA_FD. Not running under rr?\n");
+  } else {
+    test_assert(ret == (ssize_t)len);
+    atomic_printf("Wrote %zu bytes to magic fd\n", len);
+  }
 }
 
+#if defined(__i386__) || defined(__x86_64)
 /**
  * Return the current value of the time-stamp counter.
  */
 inline static uint64_t rdtsc(void) { return __rdtsc(); }
+#endif
 
 /**
  * Perform some syscall that writes an event, i.e. is not syscall-buffered.
@@ -199,6 +225,31 @@ inline static size_t ceil_page_size(size_t size) {
   size_t page_size = sysconf(_SC_PAGESIZE);
   return (size + page_size - 1) & ~(page_size - 1);
 }
+
+#if defined(__i386__) || defined(__x86_64)
+#define debug_trap() __asm__("int $3")
+#define undefined_instr() __asm__("ud2")
+#elif defined(__aarch64__)
+#define debug_trap() __asm__("brk #0")
+/**
+ * GCC emits `brk #1000` for __builtin_trap,
+ * Clang emits `brk #1` for the same.
+ * It appears there was some plans early on to generate
+ * SIGILL for breakpoint instructions with a high immediate,
+ * but that never materialized. Instead, to get SIGILL, we use
+ * an mrs instruction, which will cause SIGILL if the system
+ * register used isn't accessible in EL0. Which register we
+ * use doesn't matter here, but we should one that is neither
+ * unsused and might do something else in the future, nor one
+ * that the kernel or a hypervisor might emulate in the future.
+ * Here we use `S3_6_C15_C8_0` which is a microcode patching
+ * register and only available in EL3. Accessing it here
+ * should always cause SIGILL
+ */
+#define undefined_instr() __asm__("mrs x0, S3_6_C15_C8_0")
+#else
+#error "Unknown architecture"
+#endif
 
 /**
  * Allocate 'size' bytes, fill with 'value', place canary value before

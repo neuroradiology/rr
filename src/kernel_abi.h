@@ -15,15 +15,21 @@ namespace rr {
 class remote_code_ptr;
 class Task;
 
-enum SupportedArch { x86, x86_64, SupportedArch_MAX = x86_64 };
+enum SupportedArch { x86, x86_64, aarch64, SupportedArch_MAX = aarch64 };
 
 #if defined(__i386__)
 const SupportedArch RR_NATIVE_ARCH = SupportedArch::x86;
 #elif defined(__x86_64__)
 const SupportedArch RR_NATIVE_ARCH = SupportedArch::x86_64;
+#elif defined(__aarch64__)
+const SupportedArch RR_NATIVE_ARCH = SupportedArch::aarch64;
 #else
 #error need to define new SupportedArch enum
 #endif
+
+inline bool is_x86ish(SupportedArch arch_) {
+  return arch_ == x86 || arch_ == x86_64;
+}
 
 template <SupportedArch a, typename system_type, typename rr_type>
 struct Verifier {
@@ -49,6 +55,12 @@ template <typename T> struct Verifier<RR_NATIVE_ARCH, T, T> {
 #define RR_VERIFY_TYPE_ARCH(arch_, system_type_, rr_type_) // no-op
 #define RR_VERIFY_TYPE_EXPLICIT(system_type_, rr_type_)    // no-op
 #define RR_VERIFY_TYPE(x)                                  // no-op
+#endif
+
+// For structs whose native definitions only exist on x86
+#ifndef RR_VERIFY_TYPE_X86
+#define RR_VERIFY_TYPE_X86_ARCH(arch_, system_type_, rr_type_) // no-op
+#define RR_VERIFY_TYPE_X86(x)                                  // no-op
 #endif
 
 struct KernelConstants {
@@ -100,6 +112,7 @@ struct FcntlConstants {
     SETPIPE_SZ = 0x400 + 7,
     GETPIPE_SZ = 0x400 + 8,
     ADD_SEALS = 0x400 + 9,
+    GET_SEALS = 0x400 + 10,
     GET_RW_HINT = 0x400 + 11,
     SET_RW_HINT = 0x400 + 12,
     GET_FILE_RW_HINT = 0x400 + 13,
@@ -114,6 +127,7 @@ enum ELFENDIAN { DATA2LSB = 1 };
 enum EM {
   I386 = 3,
   X86_64 = 62,
+  AARCH64 = 183
 };
 
 struct WordSize32Defs {
@@ -284,6 +298,9 @@ struct BaseArch : public wordsize,
                   public FcntlConstants,
                   public KernelConstants {
   static SupportedArch arch() { return arch_; }
+  static bool is_x86ish() {
+    return rr::is_x86ish(arch_);
+  }
 
   typedef typename wordsize::syscall_slong_t syscall_slong_t;
   typedef typename wordsize::syscall_ulong_t syscall_ulong_t;
@@ -330,6 +347,54 @@ struct BaseArch : public wordsize,
   typedef uint32_t __u32;
   typedef uint64_t __u64;
   typedef __u64 aligned_u64 __attribute((aligned(8)));
+
+  // These are the same across all architectures. The kernel defines them for
+  // all architectures in the uapi headers, but the libc's headers may not.
+  // Further, the libc headers may conflict with the kernel headers, so for
+  // simplicitly, we just define everything here:
+  static const int PTRACE_TRACEME = 0;
+  static const int PTRACE_PEEKTEXT = 1;
+  static const int PTRACE_PEEKDATA = 2;
+  static const int PTRACE_PEEKUSR = 3;
+  static const int PTRACE_POKETEXT = 4;
+  static const int PTRACE_POKEDATA = 5;
+  static const int PTRACE_POKEUSR = 6;
+  static const int PTRACE_CONT = 7;
+  static const int PTRACE_KILL = 8;
+  static const int PTRACE_SINGLESTEP = 9;
+
+  // If they are defined in the header, undef them now.
+  // In rr, we always refer to them as these constants.
+#undef PTRACE_GETREGS
+#undef PTRACE_SETREGS
+#undef PTRACE_GETFPREGS
+#undef PTRACE_SETFPREGS
+#undef PTRACE_GETFPXREGS
+#undef PTRACE_SETFPXREGS
+#undef PTRACE_OLDSETOPTIONS
+#undef PTRACE_GET_THREAD_AREA
+#undef PTRACE_SET_THREAD_AREA
+#undef PTRACE_ARCH_PRCTL
+#undef PTRACE_SYSEMU
+#undef PTRACE_SYSEMU_SINGLESTEP
+
+  // These are architecture specific and may not exist on any given
+  // architecture or the number assigned on the architecture may vary.
+  // Here we give each of these a unique negative number that makes writing
+  // architecture generic code easier (the same approach is used for
+  // architecture specific syscalls).
+  static const int PTRACE_GETREGS = -1;
+  static const int PTRACE_SETREGS = -2;
+  static const int PTRACE_GETFPREGS = -3;
+  static const int PTRACE_SETFPREGS = -4;
+  static const int PTRACE_GETFPXREGS = -5;
+  static const int PTRACE_SETFPXREGS = -6;
+  static const int PTRACE_OLDSETOPTIONS = -7;
+  static const int PTRACE_GET_THREAD_AREA = -8;
+  static const int PTRACE_SET_THREAD_AREA = -9;
+  static const int PTRACE_ARCH_PRCTL = -10;
+  static const int PTRACE_SYSEMU = -11;
+  static const int PTRACE_SYSEMU_SINGLESTEP = -12;
 
   template <typename T> struct ptr {
     typedef T Referent;
@@ -652,18 +717,6 @@ struct BaseArch : public wordsize,
   };
   RR_VERIFY_TYPE(shm_info);
 
-  struct semid64_ds {
-    ipc64_perm sem_perm;
-    __kernel_time_t sem_otime;
-    __kernel_ulong_t __unused1;
-    __kernel_time_t sem_ctime;
-    __kernel_ulong_t __unused2;
-    __kernel_ulong_t sem_nsems;
-    __kernel_ulong_t __unused3;
-    __kernel_ulong_t __unused4;
-  };
-  RR_VERIFY_TYPE(semid64_ds);
-
   struct seminfo {
     int semmap;
     int semmni;
@@ -711,7 +764,7 @@ struct BaseArch : public wordsize,
     unsigned_int useable : 1;
     unsigned_int lm : 1;
   };
-  RR_VERIFY_TYPE(user_desc);
+  RR_VERIFY_TYPE_X86(user_desc);
 
   struct __user_cap_header_struct {
     __u32 version;
@@ -867,27 +920,6 @@ struct BaseArch : public wordsize,
     iwreq_data u;
   };
   RR_VERIFY_TYPE(iwreq);
-
-  struct ethtool_cmd {
-    uint32_t cmd;
-    uint32_t supported;
-    uint32_t advertising;
-    uint16_t speed;
-    uint8_t duplex;
-    uint8_t port;
-    uint8_t phy_address;
-    uint8_t transceiver;
-    uint8_t autoneg;
-    uint8_t mdio_support;
-    uint32_t maxtxpkt;
-    uint32_t maxrxpkt;
-    uint16_t speed_hi;
-    uint8_t eth_tp_mdix;
-    uint8_t eth_tp_mdix_ctrl;
-    uint32_t lp_advertising;
-    uint32_t reserved[2];
-  };
-  RR_VERIFY_TYPE(ethtool_cmd);
 
   struct _flock {
     signed_short l_type;
@@ -1228,10 +1260,10 @@ struct BaseArch : public wordsize,
   RR_VERIFY_TYPE(sched_param);
 
   static void* cmsg_data(cmsghdr* cmsg) { return cmsg + 1; }
-  static size_t cmsg_align(size_t len) {
+  static constexpr size_t cmsg_align(size_t len) {
     return (len + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1);
   }
-  static size_t cmsg_space(size_t len) {
+  static constexpr size_t cmsg_space(size_t len) {
     return cmsg_align(sizeof(cmsghdr)) + cmsg_align(len);
   }
   static size_t cmsg_len(size_t len) {
@@ -1613,173 +1645,33 @@ struct BaseArch : public wordsize,
       __u32 line_info_cnt;
     };
   };
-};
 
-struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
-  static const size_t elfmachine = EM::I386;
-  static const size_t elfendian = ELFENDIAN::DATA2LSB;
-
-  static const MmapCallingSemantics mmap_semantics = StructArguments;
-  static const CloneTLSType clone_tls_type = UserDescPointer;
-  static const CloneParameterOrdering clone_parameter_ordering =
-      FlagsStackParentTLSChild;
-  static const SelectCallingSemantics select_semantics = SelectStructArguments;
-
-  // The getgroups syscall (as well as several others) differs between
-  // architectures depending on whether they ever supported 16-bit
-  // {U,G}IDs or not.  Architectures such as x86, which did support
-  // 16-bit {U,G}IDs, have a getgroups syscall for the 16-bit GID case
-  // and a getgroups32 syscall for the 32-bit GID case.  Architectures
-  // such as as x86-64, which support 32-bit GIDs exclusively, have only
-  // a getgroups syscall.  We need to know which one we're dealing with
-  // when recording and replaying getgroups and related syscalls.
-  typedef uint16_t legacy_uid_t;
-  typedef uint16_t legacy_gid_t;
-
-#include "SyscallEnumsX86.generated"
-
-  struct user_regs_struct {
-    int32_t ebx;
-    int32_t ecx;
-    int32_t edx;
-    int32_t esi;
-    int32_t edi;
-    int32_t ebp;
-    int32_t eax;
-    int32_t xds;
-    int32_t xes;
-    int32_t xfs;
-    int32_t xgs;
-    int32_t orig_eax;
-    int32_t eip;
-    int32_t xcs;
-    int32_t eflags;
-    int32_t esp;
-    int32_t xss;
+  struct file_handle {
+    unsigned int handle_bytes;
+    int handle_type;
+    uint8_t f_handle[0];
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::user_regs_struct, user_regs_struct);
 
-  struct user_fpregs_struct {
-    int32_t cwd;
-    int32_t swd;
-    int32_t twd;
-    int32_t fip;
-    int32_t fcs;
-    int32_t foo;
-    int32_t fos;
-    int32_t st_space[20];
+  // This is technically a libc ABI, but we'll just put it here for convenience
+  struct link_map {
+    ptr<void> l_addr;
+    ptr<char> l_name;
+    ptr<void> l_ld;
+    ptr<link_map> l_next;
+    ptr<link_map> l_prev;
+    // More fields that are libc ...
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::user_fpregs_struct,
-                      user_fpregs_struct);
 
-  struct user_fpxregs_struct {
-    uint16_t cwd;
-    uint16_t swd;
-    uint16_t twd;
-    uint16_t fop;
-    int32_t fip;
-    int32_t fcs;
-    int32_t foo;
-    int32_t fos;
-    int32_t mxcsr;
-    int32_t reserved;
-    int32_t st_space[32];
-    int32_t xmm_space[32];
-    int32_t padding[56];
+  struct r_debug {
+    int r_version;
+    ptr<link_map> r_map;
+    // More fields we don't need (and are potentially libc specific)
   };
-#if defined(__i386__)
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::user_fpxregs_struct,
-                      user_fpxregs_struct);
-#endif
-
-  struct sigcontext {
-    uint16_t gs, __gsh;
-    uint16_t fs, __fsh;
-    uint16_t es, __esh;
-    uint16_t ds, __dsh;
-    uint32_t di;
-    uint32_t si;
-    uint32_t bp;
-    uint32_t sp;
-    uint32_t bx;
-    uint32_t dx;
-    uint32_t cx;
-    uint32_t ax;
-    uint32_t trapno;
-    uint32_t err;
-    uint32_t ip;
-    uint16_t cs, __csh;
-    uint32_t flags;
-    uint32_t sp_at_signal;
-    uint16_t ss, __ssh;
-    uint32_t fpstate;
-    uint32_t oldmask;
-    uint32_t cr2;
-  };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::sigcontext, sigcontext);
-
-  struct user {
-    user_regs_struct regs;
-    int u_fpvalid;
-    user_fpregs_struct i387;
-    uint32_t u_tsize;
-    uint32_t u_dsize;
-    uint32_t u_ssize;
-    uint32_t start_code;
-    uint32_t start_stack;
-    int32_t signal;
-    int reserved;
-    ptr<user_regs_struct> u_ar0;
-    ptr<user_fpregs_struct> u_fpstate;
-    uint32_t magic;
-    char u_comm[32];
-    int u_debugreg[8];
-  };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::user, user);
-
-  struct stat {
-    dev_t st_dev;
-    unsigned_short __pad1;
-    ino_t st_ino;
-    mode_t st_mode;
-    nlink_t st_nlink;
-    uid_t st_uid;
-    gid_t st_gid;
-    dev_t st_rdev;
-    unsigned_short __pad2;
-    off_t st_size;
-    blksize_t st_blksize;
-    blkcnt_t st_blocks;
-    timespec st_atim;
-    timespec st_mtim;
-    timespec st_ctim;
-    unsigned_long __unused4;
-    unsigned_long __unused5;
-  };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::stat, struct stat);
-
-  struct __attribute__((packed)) stat64 {
-    dev_t st_dev;
-    unsigned_int __pad1;
-    ino_t __st_ino;
-    mode_t st_mode;
-    nlink_t st_nlink;
-    uid_t st_uid;
-    gid_t st_gid;
-    dev_t st_rdev;
-    unsigned_int __pad2;
-    off64_t st_size;
-    blksize_t st_blksize;
-    blkcnt64_t st_blocks;
-    timespec st_atim;
-    timespec st_mtim;
-    timespec st_ctim;
-    ino64_t st_ino;
-  };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::stat64, struct stat64);
 };
 
 struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
+  typedef X64Arch Arch64;
+
   static const size_t elfmachine = EM::X86_64;
   static const size_t elfendian = ELFENDIAN::DATA2LSB;
 
@@ -1794,6 +1686,21 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   typedef uint32_t legacy_gid_t;
 
 #include "SyscallEnumsX64.generated"
+
+  // Architecture specific ptrace commands
+
+  static const int PTRACE_GETREGS = 12;
+  static const int PTRACE_SETREGS = 13;
+  static const int PTRACE_GETFPREGS = 14;
+  static const int PTRACE_SETFPREGS = 15;
+  static const int PTRACE_GETFPXREGS = 18;
+  static const int PTRACE_SETFPXREGS = 19;
+  static const int PTRACE_OLDSETOPTIONS = 21;
+  static const int PTRACE_GET_THREAD_AREA = 25;
+  static const int PTRACE_SET_THREAD_AREA = 26;
+  static const int PTRACE_ARCH_PRCTL = 30;
+  static const int PTRACE_SYSEMU = 31;
+  static const int PTRACE_SYSEMU_SINGLESTEP = 32;
 
   struct user_regs_struct {
     uint64_t r15;
@@ -1876,8 +1783,8 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     uint32_t xmm_space[64];
     uint32_t padding[24];
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user_fpregs_struct,
-                      user_fpregs_struct);
+  RR_VERIFY_TYPE_X86_ARCH(SupportedArch::x86_64, ::user_fpregs_struct,
+                          user_fpregs_struct);
 
   struct user {
     struct user_regs_struct regs;
@@ -1902,7 +1809,7 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     char u_comm[32];
     uint64_t u_debugreg[8];
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user, user);
+  RR_VERIFY_TYPE_X86_ARCH(SupportedArch::x86_64, ::user, user);
 
   struct stat {
     dev_t st_dev;
@@ -1923,24 +1830,335 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat, struct stat);
 
-  struct stat64 {
+  struct stat64 : public stat {};
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat64, struct stat64);
+
+  struct semid64_ds {
+    ipc64_perm sem_perm;
+    __kernel_time_t sem_otime;
+    __kernel_ulong_t __unused1;
+    __kernel_time_t sem_ctime;
+    __kernel_ulong_t __unused2;
+    __kernel_ulong_t sem_nsems;
+    __kernel_ulong_t __unused3;
+    __kernel_ulong_t __unused4;
+  };
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::semid64_ds, struct semid64_ds);
+};
+
+struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
+  typedef X64Arch Arch64;
+
+  static const size_t elfmachine = EM::I386;
+  static const size_t elfendian = ELFENDIAN::DATA2LSB;
+
+  static const MmapCallingSemantics mmap_semantics = StructArguments;
+  static const CloneTLSType clone_tls_type = UserDescPointer;
+  static const CloneParameterOrdering clone_parameter_ordering =
+      FlagsStackParentTLSChild;
+  static const SelectCallingSemantics select_semantics = SelectStructArguments;
+
+  // The getgroups syscall (as well as several others) differs between
+  // architectures depending on whether they ever supported 16-bit
+  // {U,G}IDs or not.  Architectures such as x86, which did support
+  // 16-bit {U,G}IDs, have a getgroups syscall for the 16-bit GID case
+  // and a getgroups32 syscall for the 32-bit GID case.  Architectures
+  // such as as x86-64, which support 32-bit GIDs exclusively, have only
+  // a getgroups syscall.  We need to know which one we're dealing with
+  // when recording and replaying getgroups and related syscalls.
+  typedef uint16_t legacy_uid_t;
+  typedef uint16_t legacy_gid_t;
+
+#include "SyscallEnumsX86.generated"
+
+  // The same as x86_64
+  static const int PTRACE_GETREGS = Arch64::PTRACE_GETREGS;
+  static const int PTRACE_SETREGS = Arch64::PTRACE_SETREGS;
+  static const int PTRACE_GETFPREGS = Arch64::PTRACE_GETFPREGS;
+  static const int PTRACE_SETFPREGS = Arch64::PTRACE_SETFPREGS;
+  static const int PTRACE_GETFPXREGS = Arch64::PTRACE_GETFPXREGS;
+  static const int PTRACE_SETFPXREGS = Arch64::PTRACE_SETFPXREGS;
+  static const int PTRACE_OLDSETOPTIONS = Arch64::PTRACE_OLDSETOPTIONS;
+  static const int PTRACE_GET_THREAD_AREA = Arch64::PTRACE_GET_THREAD_AREA;
+  static const int PTRACE_SET_THREAD_AREA = Arch64::PTRACE_SET_THREAD_AREA;
+  // PTRACE_ARCH_PRCTL does not exist on x86
+  static const int PTRACE_SYSEMU = Arch64::PTRACE_SYSEMU;
+  static const int PTRACE_SYSEMU_SINGLESTEP = Arch64::PTRACE_SYSEMU_SINGLESTEP;
+
+  struct user_regs_struct {
+    int32_t ebx;
+    int32_t ecx;
+    int32_t edx;
+    int32_t esi;
+    int32_t edi;
+    int32_t ebp;
+    int32_t eax;
+    int32_t xds;
+    int32_t xes;
+    int32_t xfs;
+    int32_t xgs;
+    int32_t orig_eax;
+    int32_t eip;
+    int32_t xcs;
+    int32_t eflags;
+    int32_t esp;
+    int32_t xss;
+  };
+  RR_VERIFY_TYPE_X86_ARCH(SupportedArch::x86, ::user_regs_struct, user_regs_struct);
+
+  struct user_fpregs_struct {
+    int32_t cwd;
+    int32_t swd;
+    int32_t twd;
+    int32_t fip;
+    int32_t fcs;
+    int32_t foo;
+    int32_t fos;
+    int32_t st_space[20];
+  };
+  RR_VERIFY_TYPE_X86_ARCH(SupportedArch::x86, ::user_fpregs_struct,
+                          user_fpregs_struct);
+
+  struct user_fpxregs_struct {
+    uint16_t cwd;
+    uint16_t swd;
+    uint16_t twd;
+    uint16_t fop;
+    int32_t fip;
+    int32_t fcs;
+    int32_t foo;
+    int32_t fos;
+    int32_t mxcsr;
+    int32_t reserved;
+    int32_t st_space[32];
+    int32_t xmm_space[32];
+    int32_t padding[56];
+  };
+#if defined(__i386__)
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::user_fpxregs_struct,
+                      user_fpxregs_struct);
+#endif
+
+  struct sigcontext {
+    uint16_t gs, __gsh;
+    uint16_t fs, __fsh;
+    uint16_t es, __esh;
+    uint16_t ds, __dsh;
+    uint32_t di;
+    uint32_t si;
+    uint32_t bp;
+    uint32_t sp;
+    uint32_t bx;
+    uint32_t dx;
+    uint32_t cx;
+    uint32_t ax;
+    uint32_t trapno;
+    uint32_t err;
+    uint32_t ip;
+    uint16_t cs, __csh;
+    uint32_t flags;
+    uint32_t sp_at_signal;
+    uint16_t ss, __ssh;
+    uint32_t fpstate;
+    uint32_t oldmask;
+    uint32_t cr2;
+  };
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::sigcontext, sigcontext);
+
+  struct user {
+    user_regs_struct regs;
+    int u_fpvalid;
+    user_fpregs_struct i387;
+    uint32_t u_tsize;
+    uint32_t u_dsize;
+    uint32_t u_ssize;
+    uint32_t start_code;
+    uint32_t start_stack;
+    int32_t signal;
+    int reserved;
+    ptr<user_regs_struct> u_ar0;
+    ptr<user_fpregs_struct> u_fpstate;
+    uint32_t magic;
+    char u_comm[32];
+    int u_debugreg[8];
+  };
+  RR_VERIFY_TYPE_X86_ARCH(SupportedArch::x86, ::user, user);
+
+  struct stat {
     dev_t st_dev;
+    unsigned_short __pad1;
     ino_t st_ino;
-    nlink_t st_nlink;
     mode_t st_mode;
+    nlink_t st_nlink;
     uid_t st_uid;
     gid_t st_gid;
-    int __pad0;
     dev_t st_rdev;
+    unsigned_short __pad2;
     off_t st_size;
     blksize_t st_blksize;
+    blkcnt_t st_blocks;
+    timespec st_atim;
+    timespec st_mtim;
+    timespec st_ctim;
+    unsigned_long __unused4;
+    unsigned_long __unused5;
+  };
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::stat, struct stat);
+
+  struct __attribute__((packed)) stat64 {
+    dev_t st_dev;
+    unsigned_int __pad1;
+    ino_t __st_ino;
+    mode_t st_mode;
+    nlink_t st_nlink;
+    uid_t st_uid;
+    gid_t st_gid;
+    dev_t st_rdev;
+    unsigned_int __pad2;
+    off64_t st_size;
+    blksize_t st_blksize;
+    blkcnt64_t st_blocks;
+    timespec st_atim;
+    timespec st_mtim;
+    timespec st_ctim;
+    ino64_t st_ino;
+  };
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::stat64, struct stat64);
+
+  struct semid64_ds {
+    ipc64_perm sem_perm;
+    __kernel_time_t sem_otime;
+    __kernel_ulong_t sem_otime_high;
+    __kernel_time_t sem_ctime;
+    __kernel_ulong_t sem_ctime_high;
+    __kernel_ulong_t sem_nsems;
+    __kernel_ulong_t __unused3;
+    __kernel_ulong_t __unused4;
+  };
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::semid64_ds, struct semid64_ds);
+};
+
+// Archs that inherit Linux's "generic" data structures
+template <SupportedArch arch_, typename wordsize>
+struct GenericArch : public BaseArch<arch_, wordsize> {
+  // All architectures using the generic syscall table only ever use 32-bit
+  // UIDs. See explanation of legacy_uid_t above.
+  typedef uint32_t legacy_uid_t;
+  typedef uint32_t legacy_gid_t;
+
+  struct stat {
+    dev_t st_dev;
+    ino_t st_ino;
+    mode_t st_mode;
+    nlink_t st_nlink;
+    uid_t st_uid;
+    gid_t st_gid;
+    dev_t st_rdev;
+    unsigned long __pad1;
+    off_t st_size;
+    blksize_t st_blksize;
+    int __pad2;
     blkcnt_t st_blocks;
     struct timespec st_atim;
     struct timespec st_mtim;
     struct timespec st_ctim;
-    syscall_slong_t __rr_unused[3];
+    int __rr_unused[2];
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat64, struct stat64);
+
+  struct semid64_ds {
+    typename BaseArch<arch_, wordsize>::ipc64_perm sem_perm;
+    uint64_t sem_otime;
+    uint64_t sem_ctime;
+    typename BaseArch<arch_, wordsize>::unsigned_long sem_nsems;
+    typename BaseArch<arch_, wordsize>::unsigned_long __unused3;
+    typename BaseArch<arch_, wordsize>::unsigned_long __unused4;
+  };
+
+  struct stat64 : public stat {};
+};
+
+struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
+  typedef ARM64Arch Arch64;
+
+  static const size_t elfmachine = EM::AARCH64;
+  static const size_t elfendian = ELFENDIAN::DATA2LSB;
+
+  static const MmapCallingSemantics mmap_semantics = RegisterArguments;
+  static const CloneTLSType clone_tls_type = PthreadStructurePointer;
+  static const CloneParameterOrdering clone_parameter_ordering =
+      FlagsStackParentTLSChild;
+  static const SelectCallingSemantics select_semantics =
+      SelectRegisterArguments;
+
+#include "SyscallEnumsGeneric.generated"
+
+  // Architecture specific ptrace commands
+  static const int PTRACE_SYSEMU = 31;
+  static const int PTRACE_SYSEMU_SINGLESTEP = 32;
+
+  struct user_pt_regs {
+    uint64_t x[31];
+    uint64_t sp;
+    uint64_t pc;
+    uint64_t pstate;
+  };
+  typedef struct user_pt_regs user_regs_struct;
+
+#if defined (__i386__)
+  typedef struct {
+    uint64_t parts[2];
+  } __uint128_t;
+#endif
+  struct user_fpsimd_state {
+    __uint128_t vregs[32];
+    uint32_t fpsr;
+    uint32_t fpcr;
+    uint32_t rr_reserved[2];
+  };
+  typedef struct user_fpsimd_state user_fpregs_struct;
+
+  struct hw_breakpoint_ctrl {
+    uint32_t enabled:1;
+    uint32_t priv:2;
+    uint32_t type:2;
+    uint32_t length:8;
+    uint32_t _pad:19;
+  };
+  static_assert(sizeof(hw_breakpoint_ctrl) == sizeof(uint32_t), "Size mismatch");
+
+  struct hw_bp {
+    uint64_t addr;
+    hw_breakpoint_ctrl ctrl;
+    uint32_t _pad;
+  };
+
+  struct user_hwdebug_state {
+    uint32_t dbg_info;
+    uint32_t pad;
+    struct hw_bp dbg_regs[16];
+  };
+
+  struct sigcontext {
+    __u64 fault_addr;
+    user_pt_regs regs;
+    // ISA extension state follows here
+  };
+
+  struct ucontext {
+    unsigned long	uc_flags;
+    ptr<ucontext> uc_link;
+    stack_t		  uc_stack;
+    sigset_t	  uc_sigmask;
+    uint8_t __unused[1024 / 8 - sizeof(sigset_t)];
+    struct sigcontext uc_mcontext;
+  };
+
+  struct rt_sigframe {
+    siginfo_t info;
+    struct ucontext uc;
+  };
+
+  RR_VERIFY_TYPE_ARCH(SupportedArch::aarch64, struct ::semid64_ds, struct semid64_ds);
 };
 
 #define RR_ARCH_FUNCTION(f, arch, args...)                                     \
@@ -1952,6 +2170,8 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
       return f<rr::X86Arch>(args);                                             \
     case x86_64:                                                               \
       return f<rr::X64Arch>(args);                                             \
+    case aarch64:                                                              \
+      return f<rr::ARM64Arch>(args);                                           \
   }
 
 #include "SyscallHelperFunctions.generated"
@@ -1961,12 +2181,12 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
  * and if so, return the architecture for which this is a syscall in *arch.
  */
 bool get_syscall_instruction_arch(Task* t, remote_code_ptr ptr,
-                                  SupportedArch* arch);
+                                  SupportedArch* arch, bool* ok=nullptr);
 
 /**
  * Return true if |ptr| in task |t| points to an invoke-syscall instruction.
  */
-bool is_at_syscall_instruction(Task* t, remote_code_ptr ptr);
+bool is_at_syscall_instruction(Task* t, remote_code_ptr ptr, bool* ok=nullptr);
 
 /**
  * Return the code bytes of an invoke-syscall instruction. The vector must
@@ -1980,13 +2200,40 @@ std::vector<uint8_t> syscall_instruction(SupportedArch arch);
  */
 ssize_t syscall_instruction_length(SupportedArch arch);
 
+/**
+ * Return the length of the breakpoint instruction.
+ */
+ssize_t bkpt_instruction_length(SupportedArch arch);
+
+// The maximum breakpoint instruction length for any architecture
+static const int MAX_BKPT_INSTRUCTION_LENGTH = 4;
+
+/**
+ * Return the length of the vsyscall invocation pattern. Currently,
+ * we only support patterns of the form movq %addr, %rax; callq *%rax.
+ */
+ssize_t vsyscall_entry_length(SupportedArch arch);
+
+/**
+ * Return the length of the mov (m),r instruction we use to cause intentional,
+ * conditional, memory traps.
+ */
+ssize_t movrm_instruction_length(SupportedArch arch);
+
 void set_arch_siginfo(const siginfo_t& siginfo, SupportedArch a, void* dest,
                       size_t dest_size);
+
+size_t sigaction_sigset_size(SupportedArch arch);
+
+size_t user_regs_struct_size(SupportedArch arch);
+size_t user_fpregs_struct_size(SupportedArch arch);
 
 #if defined(__i386__)
 typedef X86Arch NativeArch;
 #elif defined(__x86_64__)
 typedef X64Arch NativeArch;
+#elif defined(__aarch64__)
+typedef ARM64Arch NativeArch;
 #else
 #error need to define new NativeArch
 #endif

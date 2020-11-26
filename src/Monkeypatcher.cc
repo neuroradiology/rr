@@ -47,10 +47,11 @@ static void write_and_record_mem(RecordTask* t, remote_ptr<T> child_addr,
 
 /**
  * RecordSession sets up an LD_PRELOAD environment variable with an entry
- * SYSCALLBUF_LIB_FILENAME_PADDED which is big enough to hold either the
- * 32-bit or 64-bit preload library file names. Immediately after exec we
- * enter this function, which patches the environment variable value with
- * the correct library name for the task's architecture.
+ * SYSCALLBUF_LIB_FILENAME_PADDED (and, if enabled, an LD_AUDIT environment
+ * variable with an entry RTLDAUDIT_LIB_FILENAME_PADDED) which is big enough to
+ * hold either the 32-bit or 64-bit preload/audit library file names.
+ * Immediately after exec we enter this function, which patches the environment
+ * variable value with the correct library name for the task's architecture.
  *
  * It's possible for this to fail if a tracee alters the LD_PRELOAD value
  * and then does an exec. That's just too bad. If we ever have to handle that,
@@ -59,15 +60,20 @@ static void write_and_record_mem(RecordTask* t, remote_ptr<T> child_addr,
  * overridden by the preload library, or might override them itself (e.g.
  * because we're recording an rr replay).
  */
-template <typename Arch> static void setup_preload_library_path(RecordTask* t) {
-  static_assert(sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) ==
-                    sizeof(SYSCALLBUF_LIB_FILENAME_32),
-                "filename length mismatch");
+#define setup_library_path(arch, env_var, soname, task) \
+  setup_library_path_arch<arch>(task, env_var, soname ## _BASE, \
+                                soname ## _PADDED, soname ## _32)
 
+template <typename Arch>
+static void setup_library_path_arch(RecordTask* t, const char* env_var,
+                                    const char* soname_base,
+                                    const char* soname_padded,
+                                    const char* soname_32) {
   const char* lib_name =
       sizeof(typename Arch::unsigned_word) < sizeof(uintptr_t)
-          ? SYSCALLBUF_LIB_FILENAME_32
-          : SYSCALLBUF_LIB_FILENAME_PADDED;
+          ? soname_32
+          : soname_padded;
+  auto env_assignment = string(env_var) + "=";
 
   auto p = t->regs().sp().cast<typename Arch::unsigned_word>();
   auto argc = t->read_mem(p);
@@ -75,17 +81,17 @@ template <typename Arch> static void setup_preload_library_path(RecordTask* t) {
   while (true) {
     auto envp = t->read_mem(p);
     if (!envp) {
-      LOG(debug) << "LD_PRELOAD not found";
+      LOG(debug) << env_var << " not found";
       return;
     }
     string env = t->read_c_str(envp);
-    if (env.find("LD_PRELOAD=") != 0) {
+    if (env.find(env_assignment) != 0) {
       ++p;
       continue;
     }
-    size_t lib_pos = env.find(SYSCALLBUF_LIB_FILENAME_BASE);
+    size_t lib_pos = env.find(soname_base);
     if (lib_pos == string::npos) {
-      LOG(debug) << SYSCALLBUF_LIB_FILENAME_BASE " not found in LD_PRELOAD";
+      LOG(debug) << soname_base << " not found in " << env_var;
       return;
     }
     size_t next_colon = env.find(':', lib_pos);
@@ -95,21 +101,36 @@ template <typename Arch> static void setup_preload_library_path(RecordTask* t) {
         ++next_colon;
       }
       if (next_colon + 1 <
-          lib_pos + sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) - 1) {
+          lib_pos + sizeof(soname_padded) - 1) {
         LOG(debug) << "Insufficient space for " << lib_name
-                   << " in LD_PRELOAD before next ':'";
+                   << " in " << env_var << " before next ':'";
         return;
       }
     }
-    if (env.length() < lib_pos + sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) - 1) {
+    if (env.length() < lib_pos + sizeof(soname_padded) - 1) {
       LOG(debug) << "Insufficient space for " << lib_name
-                 << " in LD_PRELOAD before end of string";
+                 << " in " << env_var << " before end of string";
       return;
     }
     remote_ptr<void> dest = envp + lib_pos;
-    write_and_record_mem(t, dest.cast<char>(), lib_name,
-                         sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) - 1);
+    write_and_record_mem(t, dest.cast<char>(), lib_name, strlen(soname_padded));
     return;
+  }
+}
+
+template <typename Arch> static void setup_preload_library_path(RecordTask* t) {
+  static_assert(sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) ==
+                    sizeof(SYSCALLBUF_LIB_FILENAME_32),
+                "filename length mismatch");
+  setup_library_path(Arch, "LD_PRELOAD", SYSCALLBUF_LIB_FILENAME, t);
+}
+
+template <typename Arch> static void setup_audit_library_path(RecordTask* t) {
+  static_assert(sizeof(RTLDAUDIT_LIB_FILENAME_PADDED) ==
+                    sizeof(RTLDAUDIT_LIB_FILENAME_32),
+                "filename length mismatch");
+  if (t->session().use_audit()) {
+    setup_library_path(Arch, "LD_AUDIT", RTLDAUDIT_LIB_FILENAME, t);
   }
 }
 
@@ -204,6 +225,7 @@ static remote_ptr<uint8_t> allocate_extended_jump(
                    &recorded);
       t->vm()->mapping_flags_of(addr) |= AddressSpace::Mapping::IS_PATCH_STUBS;
       t->trace_writer().write_mapped_region(t, recorded, recorded.fake_stat(),
+                                            recorded.fsname(),
                                             vector<TraceRemoteFd>(),
                                             TraceWriter::PATCH_MAPPING);
     }
@@ -257,6 +279,15 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
   // the end of the jump to our actual destination.
   auto jump_patch_start = t->regs().ip().to_data_ptr<uint8_t>();
   auto jump_patch_end = jump_patch_start + sizeof(jump_patch);
+  auto return_addr = t->regs().ip().to_data_ptr<uint8_t>().as_int() +
+                     syscall_instruction_length(x86_64) +
+                     hook.patch_region_length;
+  if ((hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST)) {
+    auto adjust = hook.patch_region_length + syscall_instruction_length(x86_64);
+    jump_patch_start -= adjust;
+    jump_patch_end -= adjust;
+    return_addr -= adjust;
+  }
 
   remote_ptr<uint8_t> extended_jump_start =
       allocate_extended_jump<ExtendedJumpPatch>(
@@ -266,9 +297,6 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
   }
 
   uint8_t stub_patch[ExtendedJumpPatch::size];
-  auto return_addr =
-    jump_patch_start.as_int() + syscall_instruction_length(x86_64) +
-    hook.next_instruction_length;
   substitute_extended_jump<ExtendedJumpPatch>(stub_patch,
                                               extended_jump_start.as_int(),
                                               return_addr,
@@ -290,7 +318,7 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
   DEBUG_ASSERT(syscall_instruction_length(x86_64) ==
                syscall_instruction_length(x86));
   size_t nops_bufsize = syscall_instruction_length(x86_64) +
-                        hook.next_instruction_length - sizeof(jump_patch);
+                        hook.patch_region_length - sizeof(jump_patch);
   std::unique_ptr<uint8_t[]> nops(new uint8_t[nops_bufsize]);
   memset(nops.get(), NOP, nops_bufsize);
   write_and_record_mem(t, jump_patch_start + sizeof(jump_patch), nops.get(),
@@ -316,6 +344,15 @@ bool patch_syscall_with_hook_arch<X64Arch>(Monkeypatcher& patcher,
                                         X64SyscallStubExtendedJump>(patcher, t,
                                                                     hook);
 }
+
+template <>
+bool patch_syscall_with_hook_arch<ARM64Arch>(Monkeypatcher&,
+                                             RecordTask*,
+                                             const syscall_patch_hook&) {
+  FATAL() << "Unimplemented";
+  return false;
+}
+
 
 static bool patch_syscall_with_hook(Monkeypatcher& patcher, RecordTask* t,
                                     const syscall_patch_hook& hook) {
@@ -364,7 +401,47 @@ static bool safe_for_syscall_patching(remote_code_ptr start,
   return true;
 }
 
-bool Monkeypatcher::try_patch_syscall(RecordTask* t) {
+bool Monkeypatcher::try_patch_vsyscall_caller(RecordTask* t, remote_code_ptr ret_addr)
+{
+  uint8_t bytes[X64VSyscallEntry::size];
+  remote_ptr<uint8_t> patch_start = ret_addr.to_data_ptr<uint8_t>() - sizeof(bytes);
+  size_t bytes_count = t->read_bytes_fallible(patch_start, sizeof(bytes), bytes);
+  if (bytes_count < sizeof(bytes)) {
+    return false;
+  }
+  uint32_t target_addr = 0;
+  if (!X64VSyscallEntry::match(bytes, &target_addr)) {
+    return false;
+  }
+  uint64_t target_addr_sext = (uint64_t)(int32_t)target_addr;
+  int syscallno = 0;
+  switch (target_addr_sext) {
+    case 0xffffffffff600000:
+      syscallno = X64Arch::gettimeofday;
+      break;
+    case 0xffffffffff600400:
+      syscallno = X64Arch::time;
+      break;
+    case 0xffffffffff600800:
+      syscallno = X64Arch::getcpu;
+      break;
+    default:
+      return false;
+  }
+  X64VSyscallReplacement::substitute(bytes, syscallno);
+  write_and_record_bytes(t, patch_start, bytes);
+  LOG(debug) << "monkeypatched vsyscall caller at " << patch_start;
+  return true;
+}
+
+// Syscalls can be patched either on entry or exit. For most syscall
+// instruction code patterns we can steal bytes after the syscall instruction
+// and thus we patch on entry, but some patterns require using bytes from
+// before the syscall instruction itself and thus can only be patched on exit.
+// The `entering_syscall` flag tells us whether or not we're at syscall entry.
+// If we are, and we find a pattern that can only be patched at exit, we'll
+// set a flag on the RecordTask telling it to try again after syscall exit.
+bool Monkeypatcher::try_patch_syscall(RecordTask* t, bool entering_syscall) {
   if (syscall_hooks.empty()) {
     // Syscall hooks not set up yet. Don't spew warnings, and don't
     // fill tried_to_patch_syscall_addresses with addresses that we might be
@@ -407,72 +484,123 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t) {
     return false;
   }
 
-  uint8_t following_bytes[256];
+  static const intptr_t MAXIMUM_LOOKBACK = 6;
+  uint8_t bytes[256 + MAXIMUM_LOOKBACK];
   size_t bytes_count = t->read_bytes_fallible(
-      ip.to_data_ptr<uint8_t>(), sizeof(following_bytes), following_bytes);
+      ip.to_data_ptr<uint8_t>() - MAXIMUM_LOOKBACK, sizeof(bytes), bytes);
+  if (bytes_count < MAXIMUM_LOOKBACK) {
+    LOG(debug) << "Declining to patch syscall at " << ip << " for lack of lookback";
+    tried_to_patch_syscall_addresses.insert(ip);
+    return false;
+  }
+  size_t following_bytes_count = bytes_count - MAXIMUM_LOOKBACK;
+  uint8_t* following_bytes = &bytes[MAXIMUM_LOOKBACK];
 
   intptr_t syscallno = r.original_syscallno();
   for (auto& hook : syscall_hooks) {
-    if (bytes_count >= hook.next_instruction_length &&
-        memcmp(following_bytes, hook.next_instruction_bytes,
-               hook.next_instruction_length) == 0) {
-      // Search for a following short-jump instruction that targets an
-      // instruction
-      // after the syscall. False positives are OK.
-      // glibc-2.23.1-8.fc24.x86_64's __clock_nanosleep needs this.
-      bool found_potential_interfering_branch = false;
-      // If this was a VDSO syscall we patched, we don't have to worry about
-      // this check since the function doesn't do anything except execute our
-      // syscall and return.
-      // Otherwise the Linux 4.12 VDSO triggers the interfering-branch check.
-      if (!patched_vdso_syscalls.count(
-              ip.decrement_by_syscall_insn_length(arch))) {
-        for (size_t i = 0; i + 2 <= bytes_count; ++i) {
-          uint8_t b = following_bytes[i];
-          // Check for short conditional or unconditional jump
-          if (b == 0xeb || (b >= 0x70 && b < 0x80)) {
-            int offset = i + 2 + (int8_t)following_bytes[i + 1];
-            if (hook.is_multi_instruction
-                    ? (offset >= 0 && offset < hook.next_instruction_length)
-                    : offset == 0) {
-              LOG(debug) << "Found potential interfering branch at "
-                         << ip.to_data_ptr<uint8_t>() + i;
-              // We can't patch this because it would jump straight back into
-              // the middle of our patch code.
-              found_potential_interfering_branch = true;
-            }
+    bool matches_hook = false;
+    if ((!(hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST) &&
+         following_bytes_count >= hook.patch_region_length &&
+         memcmp(following_bytes, hook.patch_region_bytes,
+                hook.patch_region_length) == 0)) {
+      matches_hook = true;
+    } else if ((hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST) &&
+               bytes_count >=
+                   hook.patch_region_length +
+                       (size_t)rr::syscall_instruction_length(arch) &&
+               memcmp(bytes, hook.patch_region_bytes,
+                      hook.patch_region_length) == 0) {
+      if (entering_syscall) {
+        // A patch that uses bytes before the syscall can't be done when
+        // entering the syscall, it must be done when exiting. So set a flag on
+        // the Task that tells us to come back later.
+        t->retry_syscall_patching = true;
+        LOG(debug) << "Deferring syscall patching at " << ip << " in " << t
+                   << " until syscall exit.";
+        return false;
+      }
+      matches_hook = true;
+    }
+
+    if (!matches_hook) {
+      continue;
+    }
+
+    // Search for a following short-jump instruction that targets an
+    // instruction
+    // after the syscall. False positives are OK.
+    // glibc-2.23.1-8.fc24.x86_64's __clock_nanosleep needs this.
+    bool found_potential_interfering_branch = false;
+    // If this was a VDSO syscall we patched, we don't have to worry about
+    // this check since the function doesn't do anything except execute our
+    // syscall and return.
+    // Otherwise the Linux 4.12 VDSO triggers the interfering-branch check.
+    if (!patched_vdso_syscalls.count(
+            ip.decrement_by_syscall_insn_length(arch))) {
+      size_t max_bytes, warn_offset;
+      uint8_t* search_bytes;
+      if (hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST) {
+        max_bytes = bytes_count;
+        search_bytes = bytes;
+        warn_offset = MAXIMUM_LOOKBACK;
+      } else {
+        max_bytes = following_bytes_count;
+        search_bytes = following_bytes;
+        warn_offset = 0;
+      }
+
+      for (size_t i = 0; i + 2 <= max_bytes; ++i) {
+        uint8_t b = search_bytes[i];
+        // Check for short conditional or unconditional jump
+        if (b == 0xeb || (b >= 0x70 && b < 0x80)) {
+          int offset = i + 2 + (int8_t)search_bytes[i + 1];
+          if ((hook.flags & PATCH_IS_MULTIPLE_INSTRUCTIONS)
+                  ? (offset >= 0 && offset < hook.patch_region_length)
+                  : offset == 0) {
+            LOG(debug) << "Found potential interfering branch at "
+                       << ip.to_data_ptr<uint8_t>() + i - warn_offset;
+            // We can't patch this because it would jump straight back into
+            // the middle of our patch code.
+            found_potential_interfering_branch = true;
           }
         }
       }
+    }
 
-      if (!found_potential_interfering_branch) {
-        if (!safe_for_syscall_patching(ip, ip + hook.next_instruction_length,
-                                       t)) {
-          LOG(debug)
-              << "Temporarily declining to patch syscall at " << ip
-              << " because a different task has its ip in the patched range";
-          return false;
-        }
-
-        LOG(debug) << "Patched syscall at " << ip << " syscall "
-                   << syscall_name(syscallno, t->arch()) << " tid " << t->tid
-                   << " bytes "
-                   << bytes_to_string(
-                          following_bytes,
-                          min(bytes_count,
-                              sizeof(
-                                  syscall_patch_hook::next_instruction_bytes)));
-
-        // Get out of executing the current syscall before we patch it.
-        if (!t->exit_syscall_and_prepare_restart()) {
-          return false;
-        }
-
-        patch_syscall_with_hook(*this, t, hook);
-
-        // Return to caller, which resume normal execution.
-        return true;
+    if (!found_potential_interfering_branch) {
+      remote_code_ptr start_range, end_range;
+      if (hook.flags & PATCH_SYSCALL_INSTRUCTION_IS_LAST) {
+        start_range = ip.decrement_by_syscall_insn_length(arch) -
+                      hook.patch_region_length;
+        end_range = ip;
+      } else {
+        start_range = ip.decrement_by_syscall_insn_length(arch);
+        end_range = ip + hook.patch_region_length;
       }
+      if (!safe_for_syscall_patching(start_range, end_range, t)) {
+        LOG(debug)
+            << "Temporarily declining to patch syscall at " << ip
+            << " because a different task has its ip in the patched range";
+        return false;
+      }
+
+      LOG(debug) << "Patched syscall at " << ip << " syscall "
+                 << syscall_name(syscallno, t->arch()) << " tid " << t->tid
+                 << " bytes "
+                 << bytes_to_string(
+                        following_bytes,
+                        min(bytes_count,
+                            sizeof(syscall_patch_hook::patch_region_bytes)));
+
+      // Get out of executing the current syscall before we patch it.
+      if (entering_syscall && !t->exit_syscall_and_prepare_restart()) {
+        return false;
+      }
+
+      patch_syscall_with_hook(*this, t, hook);
+
+      // Return to caller, which resume normal execution.
+      return true;
     }
   }
   LOG(debug) << "Failed to patch syscall at " << ip << " syscall "
@@ -481,7 +609,7 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t) {
              << bytes_to_string(
                     following_bytes,
                     min(bytes_count,
-                        sizeof(syscall_patch_hook::next_instruction_bytes)));
+                        sizeof(syscall_patch_hook::patch_region_bytes)));
   tried_to_patch_syscall_addresses.insert(ip);
   return false;
 }
@@ -602,6 +730,12 @@ static void obliterate_debug_info(RecordTask* t, VdsoReader& reader) {
 template <>
 void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
   setup_preload_library_path<X86Arch>(t);
+  setup_audit_library_path<X86Arch>(t);
+
+  if (!t->vm()->has_vdso()) {
+    patch_auxv_vdso(t);
+    return;
+  }
 
   VdsoReader reader(t);
   auto syms = reader.read_symbols(".dynsym", ".dynstr");
@@ -630,10 +764,11 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
 
   static const named_syscall syscalls_to_monkeypatch[] = {
 #define S(n) { "__vdso_" #n, X86Arch::n }
-    S(clock_gettime), S(gettimeofday), S(time),
+    S(clock_gettime), S(gettimeofday), S(time), S(clock_getres), S(clock_gettime64)
 #undef S
   };
 
+  uintptr_t max_file_offset = 0;
   for (size_t i = 0; i < syms.size(); ++i) {
     for (size_t j = 0; j < array_length(syscalls_to_monkeypatch); ++j) {
       if (syms.is_name(i, syscalls_to_monkeypatch[j].name)) {
@@ -647,24 +782,50 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
           // duplicate of another symbol. Bizzarro. Ignore it.
           continue;
         }
+        if (file_offset > max_file_offset) {
+          max_file_offset = file_offset;
+        }
+      }
+    }
+  }
+
+  uintptr_t shared_address = vdso_start.as_int() + max_file_offset + X86VsyscallMonkeypatch::size;
+
+  for (size_t i = 0; i < syms.size(); ++i) {
+    for (size_t j = 0; j < array_length(syscalls_to_monkeypatch); ++j) {
+      if (syms.is_name(i, syscalls_to_monkeypatch[j].name)) {
+        uintptr_t file_offset;
+        if (!reader.addr_to_offset(syms.addr(i), file_offset)) {
+          continue;
+        }
+        if (file_offset > MAX_VDSO_SIZE) {
+          continue;
+        }
 
         uintptr_t absolute_address = vdso_start.as_int() + file_offset;
 
         uint8_t patch[X86VsyscallMonkeypatch::size];
         uint32_t syscall_number = syscalls_to_monkeypatch[j].syscall_number;
-        X86VsyscallMonkeypatch::substitute(patch, syscall_number);
+        X86VsyscallMonkeypatch::substitute(patch, syscall_number,
+          shared_address - (absolute_address + X86VsyscallMonkeypatch::size - 1));
 
         write_and_record_bytes(t, absolute_address, patch);
-        // Record the location of the syscall instruction, skipping the
-        // "push %ebx; mov $syscall_number,%eax".
-        patcher.patched_vdso_syscalls.insert(
-            remote_code_ptr(absolute_address + 6));
         LOG(debug) << "monkeypatched " << syscalls_to_monkeypatch[j].name
                    << " to syscall "
                    << syscalls_to_monkeypatch[j].syscall_number;
       }
     }
   }
+
+  if (max_file_offset > 0) {
+    uint8_t patch[X86VsyscallMonkeypatchShared::size];
+    X86VsyscallMonkeypatchShared::substitute(patch);
+    write_and_record_bytes(t, shared_address, patch);
+    LOG(debug) << "monkeypatched shared stub";
+    // Record the location of the syscall instruction
+    patcher.patched_vdso_syscalls.insert(remote_code_ptr(shared_address + 8));
+  }
+
   obliterate_debug_info(t, reader);
 }
 
@@ -723,6 +884,19 @@ void patch_at_preload_init_arch<X86Arch>(RecordTask* t,
 template <>
 void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
   setup_preload_library_path<X64Arch>(t);
+  setup_audit_library_path<X64Arch>(t);
+
+  for (const auto& m : t->vm()->maps()) {
+    auto& km = m.map;
+    patcher.patch_after_mmap(t, km.start(), km.size(),
+                             km.file_offset_bytes()/page_size(), -1,
+                             Monkeypatcher::MMAP_EXEC);
+  }
+
+  if (!t->vm()->has_vdso()) {
+    patch_auxv_vdso(t);
+    return;
+  }
 
   auto vdso_start = t->vm()->vdso().start();
   size_t vdso_size = t->vm()->vdso().size();
@@ -732,7 +906,7 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
 
   static const named_syscall syscalls_to_monkeypatch[] = {
 #define S(n) { "__vdso_" #n, X64Arch::n }
-    S(clock_gettime), S(gettimeofday), S(time), S(getcpu),
+    S(clock_gettime), S(clock_getres), S(gettimeofday), S(time), S(getcpu),
 #undef S
   };
 
@@ -787,12 +961,66 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
   }
 
   obliterate_debug_info(t, reader);
+}
+
+template <>
+void patch_after_exec_arch<ARM64Arch>(RecordTask* t, Monkeypatcher& patcher) {
+  setup_preload_library_path<ARM64Arch>(t);
+  setup_audit_library_path<ARM64Arch>(t);
 
   for (const auto& m : t->vm()->maps()) {
     auto& km = m.map;
     patcher.patch_after_mmap(t, km.start(), km.size(),
                              km.file_offset_bytes()/page_size(), -1,
                              Monkeypatcher::MMAP_EXEC);
+  }
+
+  if (!t->vm()->has_vdso()) {
+    patch_auxv_vdso(t);
+    return;
+  }
+
+  auto vdso_start = t->vm()->vdso().start();
+
+  VdsoReader reader(t);
+  auto syms = reader.read_symbols(".dynsym", ".dynstr");
+
+  static const named_syscall syscalls_to_monkeypatch[] = {
+#define S(n) { "__kernel_" #n, ARM64Arch::n }
+    S(rt_sigreturn), S(gettimeofday), S(clock_gettime), S(clock_getres),
+#undef S
+  };
+
+  for (auto& syscall : syscalls_to_monkeypatch) {
+    for (size_t i = 0; i < syms.size(); ++i) {
+      if (syms.is_name(i, syscall.name)) {
+        uintptr_t file_offset;
+        if (!reader.addr_to_offset(syms.addr(i), file_offset)) {
+          LOG(debug) << "Can't convert address " << HEX(syms.addr(i))
+                     << " to offset";
+          continue;
+        }
+
+        uint64_t file_offset_64 = file_offset;
+        static const uint64_t vdso_max_size = 0xffffLL;
+        uint64_t sym_offset = file_offset_64 & vdso_max_size;
+        uintptr_t absolute_address = vdso_start.as_int() + sym_offset;
+
+        uint8_t patch[ARM64VdsoMonkeypatch::size];
+        uint32_t syscall_number = syscall.syscall_number;
+        ARM64VdsoMonkeypatch::substitute(patch, syscall_number);
+
+        write_and_record_bytes(t, absolute_address, patch);
+        // Record the location of the syscall instruction, skipping the
+        // "mov $syscall_number,x8".
+        patcher.patched_vdso_syscalls.insert(
+            remote_code_ptr(absolute_address + 4));
+        LOG(debug) << "monkeypatched " << syscall.name << " to syscall "
+                    << syscall.syscall_number << " at "
+                    << HEX(absolute_address) << " (" << HEX(file_offset)
+                    << ")";
+      }
+    }
   }
 }
 
@@ -807,6 +1035,17 @@ void patch_at_preload_init_arch<X64Arch>(RecordTask* t,
 
   patcher.init_dynamic_syscall_patching(t, params.syscall_patch_hook_count,
                                         params.syscall_patch_hooks);
+}
+
+template <>
+void patch_at_preload_init_arch<ARM64Arch>(RecordTask* t,
+                                           Monkeypatcher&) {
+  auto params = t->read_mem(
+      remote_ptr<rrcall_init_preload_params<ARM64Arch>>(t->regs().arg1()));
+  if (!params.syscallbuf_enabled) {
+    return;
+  }
+  FATAL() << "Unimplemented";
 }
 
 void Monkeypatcher::patch_after_exec(RecordTask* t) {
@@ -879,10 +1118,18 @@ static void patch_dl_runtime_resolve(Monkeypatcher& patcher,
     return;
   }
 
-  uint8_t impl[X64DLRuntimeResolve::size];
+  uint8_t impl[X64DLRuntimeResolve::size + X64EndBr::size];
+  uint8_t *impl_start = impl;
   t->read_bytes(addr, impl);
-  if (!X64DLRuntimeResolve::match(impl) &&
-      !X64DLRuntimeResolve2::match(impl)) {
+  if (X64EndBr::match(impl) || X86EndBr::match(impl)) {
+    assert(X64EndBr::size == X86EndBr::size);
+    LOG(debug) << "Starts with endbr, skipping";
+    addr += X64EndBr::size;
+    impl_start += X64EndBr::size;
+  }
+
+  if (!X64DLRuntimeResolve::match(impl_start) &&
+      !X64DLRuntimeResolve2::match(impl_start)) {
     LOG(warn) << "_dl_runtime_resolve implementation doesn't look right";
     return;
   }

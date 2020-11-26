@@ -2,6 +2,7 @@
 
 #include "GdbServer.h"
 
+#include <elf.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "BreakpointCondition.h"
+#include "ElfReader.h"
 #include "GdbCommandHandler.h"
 #include "GdbExpression.h"
 #include "ReplaySession.h"
@@ -61,6 +63,12 @@ static const string& gdb_rr_macros() {
        << "restart at checkpoint N\n"
        << "checkpoints are created with the 'checkpoint' command\n"
        << "end\n"
+       << "define seek-ticks\n"
+       << "  run t$arg0\n"
+       << "end\n"
+       << "document seek-ticks\n"
+       << "restart at given ticks value\n"
+       << "end\n"
        // In gdb version "Fedora 7.8.1-30.fc21", a raw "run" command
        // issued before any user-generated resume-execution command
        // results in gdb hanging just after the inferior hits an internal
@@ -72,40 +80,40 @@ static const string& gdb_rr_macros() {
        // issue the "stepi" command, then gdb refuses to restart
        // execution.
        << "define hook-run\n"
-       << "  rr-run-c \"if $_thread != 0 && !$suppress_run_hook\\nstepi\\nend\"\n"
+       << "  rr-hook-run\n"
        << "end\n"
        << "define hookpost-continue\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-step\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-stepi\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-next\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-nexti\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-finish\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-reverse-continue\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-reverse-step\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-reverse-stepi\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-reverse-finish\n"
-       << "  rr-run-c set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-run\n"
-       << "  rr-run-c set $suppress_run_hook = 0\n"
+       << "  rr-set-suppress-run-hook 0\n"
        << "end\n"
        << "set unwindonsignal on\n"
        << "handle SIGURG stop\n"
@@ -238,6 +246,9 @@ void GdbServer::dispatch_regs_request(const Registers& regs,
       break;
     case x86_64:
       end = have_AVX ? DREG_64_YMM15H : DREG_ORIG_RAX;
+      break;
+    case aarch64:
+      end = DREG_FPCR;
       break;
     default:
       FATAL() << "Unknown architecture";
@@ -405,35 +416,85 @@ void GdbServer::dispatch_debugger_request(Session& session,
     case DREQ_FILE_OPEN:
       // We only support reading files
       if (req.file_open().flags == O_RDONLY) {
-        int fd = open_file(session, req.file_open().file_name);
+        Task* t = session.find_task(last_continue_tuid);
+        int fd = open_file(session, t, req.file_open().file_name);
         dbg->reply_open(fd, fd >= 0 ? 0 : ENOENT);
       } else {
         dbg->reply_open(-1, EACCES);
       }
       return;
     case DREQ_FILE_PREAD: {
-      auto it = files.find(req.file_pread().fd);
-      if (it != files.end()) {
-        size_t size = min<uint64_t>(req.file_pread().size, 1024 * 1024);
-        vector<uint8_t> data;
-        data.resize(size);
-        ssize_t bytes =
-            read_to_end(it->second, req.file_pread().offset, data.data(), size);
-        dbg->reply_pread(data.data(), bytes, bytes >= 0 ? 0 : errno);
-      } else {
-        dbg->reply_pread(nullptr, 0, EBADF);
+      GdbRequest::FilePread read_req = req.file_pread();
+      {
+        auto it = files.find(read_req.fd);
+        if (it != files.end()) {
+          size_t size = min<uint64_t>(read_req.size, 1024 * 1024);
+          vector<uint8_t> data;
+          data.resize(size);
+          ssize_t bytes =
+              read_to_end(it->second, read_req.offset, data.data(), size);
+          dbg->reply_pread(data.data(), bytes, bytes >= 0 ? 0 : -errno);
+          return;
+        }
       }
+      {
+        auto it = memory_files.find(read_req.fd);
+        if (it != memory_files.end()) {
+          // Search our mmap stream for a record that can satisfy this request
+          TraceReader tmp_reader(timeline.current_session().trace_reader());
+          tmp_reader.rewind();
+          while (true) {
+            TraceReader::MappedData data;
+            bool found;
+            KernelMapping km = tmp_reader.read_mapped_region(
+                &data, &found, TraceReader::DONT_VALIDATE, TraceReader::ANY_TIME);
+            if (!found)
+              break;
+            if (it->second == FileId(km)) {
+              if (data.source != TraceReader::SOURCE_FILE) {
+                LOG(warn) << "Not serving file because it is not a file source";
+                break;
+              }
+              ScopedFd fd(data.file_name.c_str(), O_RDONLY);
+              vector<uint8_t> data;
+              data.resize(read_req.size);
+              LOG(debug) << "Reading " << read_req.size << " bytes at offset " <<
+                read_req.offset;
+              ssize_t bytes =
+                  read_to_end(fd, read_req.offset, data.data(), read_req.size);
+              if (bytes < (ssize_t)read_req.size) {
+                LOG(warn) << "Requested " << read_req.size << " bytes but only got " << bytes;
+              }
+              dbg->reply_pread(data.data(), bytes, bytes >= 0 ? 0 : -errno);
+              return;
+            }
+          }
+          LOG(warn) << "No mapping found";
+          dbg->reply_pread(nullptr, 0, EIO);
+        }
+      }
+      LOG(warn) << "Unknown file descriptor requested";
+      dbg->reply_pread(nullptr, 0, EIO);
       return;
     }
     case DREQ_FILE_CLOSE: {
-      auto it = files.find(req.file_close().fd);
-      if (it != files.end()) {
-        files.erase(it);
-        dbg->reply_close(0);
-      } else {
-        dbg->reply_close(EBADF);
+      {
+        auto it = files.find(req.file_close().fd);
+        if (it != files.end()) {
+          files.erase(it);
+          dbg->reply_close(0);
+          return;
+        }
+      } {
+        auto it = memory_files.find(req.file_close().fd);
+        if (it != memory_files.end()) {
+          memory_files.erase(it);
+          dbg->reply_close(0);
+          return;
+        }
       }
-      return;
+      LOG(warn) << "Unable to find file descriptor for close";
+      dbg->reply_close(EBADF);
     }
     default:
       /* fall through to next switch stmt */
@@ -504,6 +565,14 @@ void GdbServer::dispatch_debugger_request(Session& session,
         dbg->reply_set_mem(true);
         return;
       }
+      // If an address is recognised as belonging to a SystemTap semaphore it's
+      // because it was detected by the audit library during recording and
+      // pre-incremented.
+      if (target->vm()->is_stap_semaphore(req.mem().addr)) {
+        LOG(info) << "Suppressing write to SystemTap semaphore";
+        dbg->reply_set_mem(true);
+        return;
+      }
       // We only allow the debugger to write memory if the
       // memory will be written to an diversion session.
       // Arbitrary writes to replay sessions cause
@@ -569,7 +638,7 @@ void GdbServer::dispatch_debugger_request(Session& session,
       return;
     }
     case DREQ_SET_SW_BREAK: {
-      ASSERT(target, req.watch().kind == sizeof(AddressSpace::breakpoint_insn))
+      ASSERT(target, req.watch().kind == bkpt_instruction_length(target->arch()))
           << "Debugger setting bad breakpoint insn";
       // Mirror all breakpoint/watchpoint sets/unsets to the target process
       // if it's not part of the timeline (i.e. it's a diversion).
@@ -797,11 +866,24 @@ void GdbServer::maybe_notify_stop(const GdbRequest& req,
                                   const BreakStatus& break_status) {
   bool do_stop = false;
   remote_ptr<void> watch_addr;
+  char watch[1024];
+  watch[0] = '\0';
   if (!break_status.watchpoints_hit.empty()) {
     do_stop = true;
     memset(&stop_siginfo, 0, sizeof(stop_siginfo));
     stop_siginfo.si_signo = SIGTRAP;
     watch_addr = break_status.watchpoints_hit[0].addr;
+    bool any_hw_break = false;
+    for (const auto& w : break_status.watchpoints_hit) {
+      if (w.type == WATCH_EXEC) {
+        any_hw_break = true;
+      }
+    }
+    if (dbg->hwbreak_supported() && any_hw_break) {
+      snprintf(watch, sizeof(watch) - 1, "hwbreak:;");
+    } else if (watch_addr) {
+      snprintf(watch, sizeof(watch) - 1, "watch:%" PRIxPTR ";", watch_addr.as_int());
+    }
     LOG(debug) << "Stopping for watchpoint at " << watch_addr;
   }
   if (break_status.breakpoint_hit || break_status.singlestep_complete) {
@@ -809,6 +891,9 @@ void GdbServer::maybe_notify_stop(const GdbRequest& req,
     memset(&stop_siginfo, 0, sizeof(stop_siginfo));
     stop_siginfo.si_signo = SIGTRAP;
     if (break_status.breakpoint_hit) {
+      if (dbg->swbreak_supported()) {
+        snprintf(watch, sizeof(watch) - 1, "swbreak:;");
+      }
       LOG(debug) << "Stopping for breakpoint";
     } else {
       LOG(debug) << "Stopping for singlestep";
@@ -846,7 +931,7 @@ void GdbServer::maybe_notify_stop(const GdbRequest& req,
     /* Notify the debugger and process any new requests
      * that might have triggered before resuming. */
     dbg->notify_stop(get_threadid(t), stop_siginfo.si_signo,
-                     watch_addr.as_int());
+                     watch);
     last_query_tuid = last_continue_tuid = t->tuid();
   }
 }
@@ -1341,6 +1426,55 @@ void GdbServer::restart_session(const GdbRequest& req) {
     checkpoint_to_restore = it->second;
   } else if (req.restart().type == RESTART_FROM_PREVIOUS) {
     checkpoint_to_restore = debugger_restart_checkpoint;
+  } else if (req.restart().type == RESTART_FROM_TICKS) {
+    Ticks target = req.restart().param;
+    ReplaySession &session = timeline.current_session();
+    Task* task = session.current_task();
+    FrameTime current_time = session.current_frame_time();
+    TraceReader tmp_reader(session.trace_reader());
+    FrameTime last_time = current_time;
+    if (session.ticks_at_start_of_current_event() > target) {
+      tmp_reader.rewind();
+      FrameTime task_time;
+      // EXEC and CLONE reset the ticks counter. Find the first event
+      // where the tuid matches our current task.
+      // We'll always hit at least one CLONE/EXEC event for a task
+      // (we can't debug the time before the initial exec)
+      // but set this to 0 anyway to silence compiler warnings.
+      FrameTime ticks_start_time = 0;
+      while (true) {
+        TraceTaskEvent r = tmp_reader.read_task_event(&task_time);
+        if (task_time >= current_time) {
+          break;
+        }
+        if (r.type() == TraceTaskEvent::CLONE || r.type() == TraceTaskEvent::EXEC) {
+          if (r.tid() == task->tuid().tid()) {
+            ticks_start_time = task_time;
+          }
+        }
+      }
+      // Forward the frame reader to the current event
+      last_time = ticks_start_time;
+      while (true) {
+        TraceFrame frame = tmp_reader.read_frame();
+        if (frame.time() >= ticks_start_time) {
+          break;
+        }
+      }
+    }
+    while (true) {
+      if (tmp_reader.at_end()) {
+        cout << "No event found matching specified ticks target.";
+        dbg->notify_restart_failed();
+        return;
+      }
+      TraceFrame frame = tmp_reader.read_frame();
+      if (frame.tid() == task->tuid().tid() && frame.ticks() > target) {
+        break;
+      }
+      last_time = frame.time();
+    }
+    timeline.seek_to_ticks(last_time, target);
   }
 
   interrupt_pending = true;
@@ -1361,25 +1495,26 @@ void GdbServer::restart_session(const GdbRequest& req) {
 
   stop_replaying_to_target = false;
 
-  DEBUG_ASSERT(req.restart().type == RESTART_FROM_EVENT);
-  // Note that we don't reset the target pid; we intentionally keep targeting
-  // the same process no matter what is running when we hit the event.
-  target.event = req.restart().param;
-  target.event = min(final_event - 1, target.event);
-  timeline.seek_to_before_event(target.event);
-  do {
-    ReplayResult result =
-        timeline.replay_step_forward(RUN_CONTINUE, target.event);
-    // We should never reach the end of the trace without hitting the stop
-    // condition below.
-    DEBUG_ASSERT(result.status != REPLAY_EXITED);
-    if (is_last_thread_exit(result.break_status) &&
-        result.break_status.task->thread_group()->tgid == target.pid) {
-      // Debuggee task is about to exit. Stop here.
-      in_debuggee_end_state = true;
-      break;
-    }
-  } while (!at_target());
+  if (req.restart().type == RESTART_FROM_EVENT) {
+    // Note that we don't reset the target pid; we intentionally keep targeting
+    // the same process no matter what is running when we hit the event.
+    target.event = req.restart().param;
+    target.event = min(final_event - 1, target.event);
+    timeline.seek_to_before_event(target.event);
+    do {
+      ReplayResult result =
+          timeline.replay_step_forward(RUN_CONTINUE, target.event);
+      // We should never reach the end of the trace without hitting the stop
+      // condition below.
+      DEBUG_ASSERT(result.status != REPLAY_EXITED);
+      if (is_last_thread_exit(result.break_status) &&
+          result.break_status.task->thread_group()->tgid == target.pid) {
+        // Debuggee task is about to exit. Stop here.
+        in_debuggee_end_state = true;
+        break;
+      }
+    } while (!at_target());
+  }
   activate_debugger();
 }
 
@@ -1387,23 +1522,24 @@ static uint32_t get_cpu_features(SupportedArch arch) {
   uint32_t cpu_features;
   switch (arch) {
     case x86:
-      cpu_features = 0;
+    case x86_64: {
+      cpu_features = arch == x86_64 ? GdbConnection::CPU_X86_64 : 0;
+      unsigned int AVX_cpuid_flags = AVX_FEATURE_FLAG | OSXSAVE_FEATURE_FLAG;
+      auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
+      // We're assuming here that AVX support on the system making the recording
+      // is the same as the AVX support during replay. But if that's not true,
+      // rr is totally broken anyway.
+      if ((cpuid_data.ecx & AVX_cpuid_flags) == AVX_cpuid_flags) {
+        cpu_features |= GdbConnection::CPU_AVX;
+      }
       break;
-    case x86_64:
-      cpu_features = GdbConnection::CPU_64BIT;
+    }
+    case aarch64:
+      cpu_features = GdbConnection::CPU_AARCH64;
       break;
     default:
       FATAL() << "Unknown architecture";
       return 0;
-  }
-
-  unsigned int AVX_cpuid_flags = AVX_FEATURE_FLAG | OSXSAVE_FEATURE_FLAG;
-  auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
-  // We're assuming here that AVX support on the system making the recording
-  // is the same as the AVX support during replay. But if that's not true,
-  // rr is totally broken anyway.
-  if ((cpuid_data.ecx & AVX_cpuid_flags) == AVX_cpuid_flags) {
-    cpu_features |= GdbConnection::CPU_AVX;
   }
 
   return cpu_features;
@@ -1415,7 +1551,7 @@ struct DebuggerParams {
   short port;
 };
 
-static void push_default_gdb_options(vector<string>& vec) {
+static void push_default_gdb_options(vector<string>& vec, bool serve_files = false) {
   // The gdb protocol uses the "vRun" packet to reload
   // remote targets.  The packet is specified to be like
   // "vCont", in which gdb waits infinitely long for a
@@ -1434,13 +1570,15 @@ static void push_default_gdb_options(vector<string>& vec) {
   // remote-reply timeout.
   vec.push_back("-l");
   vec.push_back("10000");
-  // For now, avoid requesting binary files through vFile. That is slow and
-  // hard to make work correctly, because gdb requests files based on the
-  // names it sees in memory and in ELF, and those names may be symlinks to
-  // the filenames in the trace, so it's hard to match those names to files in
-  // the trace.
-  vec.push_back("-ex");
-  vec.push_back("set sysroot /");
+  if (!serve_files) {
+    // For now, avoid requesting binary files through vFile. That is slow and
+    // hard to make work correctly, because gdb requests files based on the
+    // names it sees in memory and in ELF, and those names may be symlinks to
+    // the filenames in the trace, so it's hard to match those names to files in
+    // the trace.
+    vec.push_back("-ex");
+    vec.push_back("set sysroot /");
+  }
 }
 
 static void push_target_remote_cmd(vector<string>& vec, const string& host,
@@ -1536,7 +1674,8 @@ void GdbServer::serve_replay(const ConnectionFlags& flags) {
   }
   debuggee_tguid = t->thread_group()->tguid();
 
-  FrameTime first_run_event = t->vm()->first_run_event();
+  FrameTime first_run_event = std::max(t->vm()->first_run_event(),
+    t->thread_group()->first_run_event());
   if (first_run_event) {
     timeline.set_reverse_execution_barrier_event(first_run_event);
   }
@@ -1593,7 +1732,8 @@ static bool needs_target(const string& option) {
  */
 void GdbServer::launch_gdb(ScopedFd& params_pipe_fd,
                            const string& gdb_binary_file_path,
-                           const vector<string>& gdb_options) {
+                           const vector<string>& gdb_options,
+                           bool serve_files) {
   auto macros = gdb_rr_macros();
   string gdb_command_file = create_gdb_command_file(macros);
 
@@ -1613,7 +1753,7 @@ void GdbServer::launch_gdb(ScopedFd& params_pipe_fd,
 
   vector<string> args;
   args.push_back(gdb_binary_file_path);
-  push_default_gdb_options(args);
+  push_default_gdb_options(args, serve_files);
   args.push_back("-x");
   args.push_back(gdb_command_file);
   bool did_set_remote = false;
@@ -1733,7 +1873,61 @@ static ScopedFd generate_fake_proc_maps(Task* t) {
   return move(file.fd);
 }
 
-int GdbServer::open_file(Session& session, const std::string& file_name) {
+static bool is_ld_mapping(string map_name) {
+  char ld_start[] = "ld-";
+  size_t matchpos = map_name.find_last_of('/');
+  string fname = map_name.substr(matchpos == string::npos ? 0 : matchpos + 1);
+  return memcmp(fname.c_str(), ld_start,
+                sizeof(ld_start)-1) == 0;
+}
+
+static bool is_likely_interp(string fsname) {
+  return fsname == "/lib64/ld-linux-x86-64.so.2" || fsname == "/lib/ld-linux.so.2";
+}
+
+static remote_ptr<void> base_addr_from_rendezvous(Task* t, string fname)
+{
+  remote_ptr<void> interpreter_base = t->vm()->saved_interpreter_base();
+  if (!interpreter_base || !t->vm()->has_mapping(interpreter_base)) {
+    return nullptr;
+  }
+  string ld_path = t->vm()->saved_ld_path();
+  if (ld_path.length() == 0) {
+    FATAL() << "Failed to retrieve interpreter name with interpreter_base=" << interpreter_base;
+  }
+  ScopedFd ld(ld_path.c_str(), O_RDONLY);
+  if (ld < 0) {
+    FATAL() << "Open failed: " << ld_path;
+  }
+  ElfFileReader reader(ld);
+  auto syms = reader.read_symbols(".dynsym", ".dynstr");
+  static const char r_debug[] = "_r_debug";
+  bool found = false;
+  uintptr_t r_debug_offset = 0;
+  for (size_t i = 0; i < syms.size(); ++i) {
+    if (!syms.is_name(i, r_debug)) {
+      continue;
+    }
+    r_debug_offset = syms.addr(i);
+    found = true;
+  }
+  if (!found) {
+    return nullptr;
+  }
+  bool ok = true;
+  remote_ptr<NativeArch::r_debug> r_debug_remote = interpreter_base.as_int()+r_debug_offset;
+  remote_ptr<NativeArch::link_map> link_map = t->read_mem(REMOTE_PTR_FIELD(r_debug_remote, r_map), &ok);
+  while (ok && link_map != nullptr) {
+    if (fname == t->read_c_str(t->read_mem(REMOTE_PTR_FIELD(link_map, l_name), &ok), &ok)) {
+      remote_ptr<void> result = t->read_mem(REMOTE_PTR_FIELD(link_map, l_addr), &ok);
+      return ok ? result : nullptr;
+    }
+    link_map = t->read_mem(REMOTE_PTR_FIELD(link_map, l_next), &ok);
+  }
+  return nullptr;
+}
+
+int GdbServer::open_file(Session& session, Task* continue_task, const std::string& file_name) {
   // XXX should we require file_scope_pid == 0 here?
   ScopedFd contents;
 
@@ -1763,7 +1957,50 @@ int GdbServer::open_file(Session& session, const std::string& file_name) {
     } else {
       return -1;
     }
-  }
+  } else {
+    // See if we can find the file by serving one of our mappings
+    std::string normalized_file_name = file_name;
+    normalize_file_name(normalized_file_name);
+    for (const auto& m : continue_task->vm()->maps()) {
+      // The dynamic linker is generally a symlink that is resolved by the
+      // kernel when the process image gets loaded. We add a special case to
+      // substitute the correct mapping, so gdb can find the dynamic linker
+      // rendezvous structures.
+      // XXX: These don't tend to vary across systems, so hardcoding them here works
+      //      ok, but it'd be better, to just read INTERP from the main executable
+      //      and record which is the corresponding file.
+      if (m.recorded_map.fsname().compare(0,
+            normalized_file_name.length(),
+            normalized_file_name) == 0
+          || (is_ld_mapping(m.recorded_map.fsname()) &&
+              is_likely_interp(normalized_file_name)))
+      {
+        int ret_fd = 0;
+        while (files.find(ret_fd) != files.end() ||
+               memory_files.find(ret_fd) != memory_files.end()) {
+          ++ret_fd;
+        }
+        LOG(debug) << "Found as memory mapping " << m.recorded_map;
+        memory_files.insert(make_pair(ret_fd, FileId(m.recorded_map)));
+        return ret_fd;
+      }
+    }
+    // Last ditch attempt: Dig through the tracee's libc rendezvous struct to
+    // see if we can find this file by a different name (e.g. if it was opened
+    // via symlink)
+    remote_ptr<void> base = base_addr_from_rendezvous(continue_task, file_name);
+    if (base != nullptr && continue_task->vm()->has_mapping(base)) {
+      int ret_fd = 0;
+      while (files.find(ret_fd) != files.end() ||
+              memory_files.find(ret_fd) != memory_files.end()) {
+        ++ret_fd;
+      }
+      memory_files.insert(make_pair(ret_fd, FileId(continue_task->vm()->mapping_of(base).recorded_map)));
+      return ret_fd;
+    }
+    LOG(debug) << "... not found";
+    return -1;
+   }
 
   int ret_fd = 0;
   while (files.find(ret_fd) != files.end()) {
